@@ -215,15 +215,21 @@ class VanillaSetup:
         if progress_callback:
             progress_callback("Sorting music by biome...")
         
-        # Load biome_tracks.json to know which files to copy
-        if not self.biome_tracks_json.exists():
-            return False, f"biome_tracks.json not found at {self.biome_tracks_json}"
+        # Load biome_tracks.json to know which files to copy (if available)
+        biome_tracks_data = None
+        if self.biome_tracks_json.exists():
+            try:
+                with open(self.biome_tracks_json, 'r') as f:
+                    biome_tracks_data = json.load(f)
+                self.logger.log('Loaded biome_tracks.json for track organization', context='VanillaSetup')
+            except Exception as e:
+                self.logger.log(f'Could not load biome_tracks.json, using fallback: {e}', context='VanillaSetup')
+                biome_tracks_data = None
+        else:
+            self.logger.log(f'biome_tracks.json not found at {self.biome_tracks_json}, using fallback organization', context='VanillaSetup')
         
-        with open(self.biome_tracks_json, 'r') as f:
-            biome_tracks_data = json.load(f)
-        
-        # Organize music
-        success, msg = self.organize_music_files(str(temp_unpack_dir), biome_tracks_data)
+        # Organize music (will use biome_tracks_data if available, otherwise fallback)
+        success, msg = self.organize_music_files(str(temp_unpack_dir), biome_tracks_data if biome_tracks_data else {})
         if not success:
             return False, f"Organization failed: {msg}"
         
