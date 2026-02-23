@@ -17,7 +17,7 @@ if !errorlevel! equ 0 (
     for /f "tokens=*" %%i in ('where python') do set PYTHON_EXE=%%i
     set PYTHON_FOUND=1
     echo ✓ Found Python in PATH: !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM Check 2: Python installed via Microsoft Store
@@ -25,7 +25,7 @@ if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe" (
     set PYTHON_EXE=%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Microsoft Store): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM Check 3: Python installed in Program Files
@@ -33,28 +33,28 @@ if exist "C:\Program Files\Python311\python.exe" (
     set PYTHON_EXE=C:\Program Files\Python311\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Program Files): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 if exist "C:\Program Files\Python310\python.exe" (
     set PYTHON_EXE=C:\Program Files\Python310\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Program Files): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 if exist "C:\Program Files (x86)\Python311\python.exe" (
     set PYTHON_EXE=C:\Program Files (x86)\Python311\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Program Files x86): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 if exist "C:\Program Files (x86)\Python310\python.exe" (
     set PYTHON_EXE=C:\Program Files (x86)\Python310\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Program Files x86): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM Check 4: Python installed via Anaconda
@@ -62,7 +62,7 @@ if exist "%USERPROFILE%\Anaconda3\python.exe" (
     set PYTHON_EXE=%USERPROFILE%\Anaconda3\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Anaconda): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM Check 5: Python installed via Miniconda
@@ -70,7 +70,7 @@ if exist "%USERPROFILE%\Miniconda3\python.exe" (
     set PYTHON_EXE=%USERPROFILE%\Miniconda3\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Miniconda): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM Check 6: Virtual environment in this project
@@ -78,7 +78,7 @@ if exist ".venv\Scripts\python.exe" (
     set PYTHON_EXE=.venv\Scripts\python.exe
     set PYTHON_FOUND=1
     echo ✓ Found Python (Virtual environment): !PYTHON_EXE!
-    goto :run_starsound
+    goto :check_dependencies
 )
 
 REM If we get here, Python wasn't found
@@ -97,6 +97,39 @@ if !PYTHON_FOUND! equ 0 (
     echo.
     pause
     exit /b 1
+)
+
+REM Check if dependencies are installed (PyQt5 is critical)
+:check_dependencies
+echo.
+echo Checking for required dependencies...
+"!PYTHON_EXE!" -c "import PyQt5" >nul 2>&1
+if !errorlevel! neq 0 (
+    echo.
+    echo ⚠️ Missing required dependencies (PyQt5, etc.)
+    echo.
+    echo Would you like me to install them now? (Y/N)
+    set /p INSTALL_CHOICE=
+    
+    if /i "!INSTALL_CHOICE!"=="Y" (
+        echo.
+        echo Installing dependencies...
+        call SetupDependencies.bat
+        if !errorlevel! neq 0 (
+            echo.
+            echo ❌ Failed to install dependencies
+            echo Please manually run: SetupDependencies.bat
+            echo.
+            pause
+            exit /b 1
+        )
+    ) else (
+        echo.
+        echo Please run SetupDependencies.bat to install required packages
+        echo.
+        pause
+        exit /b 1
+    )
 )
 
 REM Run StarSound with the Python executable we found
