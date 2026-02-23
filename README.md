@@ -117,7 +117,7 @@ There were earlier versions, including the original that was based on Electron, 
 2. Ensure Python 3.10+ and FFmpeg are installed
 3. Run the application:
    ```bash
-   python main.py
+   starsound_gui.py
    ```
 4. Follow the 6-step workflow in the GUI
 

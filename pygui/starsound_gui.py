@@ -106,6 +106,12 @@ import random
 import webbrowser
 from pathlib import Path
 from functools import partial
+
+# ⚡ CRITICAL FIX: Add pygui directory to Python path so imports work from ANY working directory
+# This allows running: python starsound_gui.py from ANY folder, not just from pygui/
+pygui_dir = Path(__file__).parent.absolute()
+if str(pygui_dir) not in sys.path:
+    sys.path.insert(0, str(pygui_dir))
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QFileDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QMenuBar, QAction, QToolBar, QWidgetAction, QStackedLayout, QTextEdit, QDialog, QListWidget, QListWidgetItem, QButtonGroup, QRadioButton, QInputDialog, QComboBox, QCheckBox, QProgressBar
 from PyQt5.QtGui import QPainter, QColor, QLinearGradient, QBrush, QFont
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, QCoreApplication
