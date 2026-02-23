@@ -115,10 +115,26 @@ There were earlier versions, including the original that was based on Electron, 
 
 1. Clone or download this repository
 2. Ensure Python 3.10+ and FFmpeg are installed
-3. Run the application:
-   ```bash
-   starsound_gui.py
-   ```
+3. **Run the application (choose one method):**
+
+#### Method 1: Batch File (Easiest) ⭐
+Simply double-click **`RunStarSound.bat`** in the StarSound folder.
+- This automatically finds Python on your system
+- No need to configure anything
+- Works even if Python isn't in your PATH
+
+#### Method 2: Command Line
+```bash
+python pygui/starsound_gui.py
+```
+(Requires Python to be in your system PATH)
+
+#### Method 3: Virtual Environment (For Development)
+```bash
+.venv\Scripts\activate
+python pygui/starsound_gui.py
+```
+
 4. Follow the 6-step workflow in the GUI
 
 ### Quick Workflow
