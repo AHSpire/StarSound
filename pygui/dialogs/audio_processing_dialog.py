@@ -200,7 +200,7 @@ class AudioProcessingDialog(QDialog):
         
         # Trim Start checkbox
         self.silence_trim_start_cb = QCheckBox('Trim Start')
-        self.silence_trim_start_cb.setChecked(True)
+        self.silence_trim_start_cb.setChecked(False)
         self.silence_trim_start_cb.setStyleSheet('QCheckBox { color: #e6ecff; }')
         silence_start_layout.addWidget(self.silence_trim_start_cb)
         
@@ -238,7 +238,7 @@ class AudioProcessingDialog(QDialog):
         
         # Trim End checkbox
         self.silence_trim_end_cb = QCheckBox('Trim End')
-        self.silence_trim_end_cb.setChecked(True)
+        self.silence_trim_end_cb.setChecked(False)
         self.silence_trim_end_cb.setStyleSheet('QCheckBox { color: #e6ecff; }')
         silence_end_layout.addWidget(self.silence_trim_end_cb)
         

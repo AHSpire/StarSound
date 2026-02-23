@@ -97,6 +97,8 @@ if defined REQUIREMENTS_FILE (
     "!PYTHON_EXE!" -m pip install PyQt5
     echo Installing PyDub...
     "!PYTHON_EXE!" -m pip install pydub
+    echo Installing Pillow...
+    "!PYTHON_EXE!" -m pip install Pillow
 )
 
 if !errorlevel! neq 0 (

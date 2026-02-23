@@ -185,8 +185,13 @@ class VanillaSetupWizard(QDialog):
                 self,
                 'Awesome! You\'re all set!',
                 'The original Starbound music is now ready to preview!\n\n'
-                'Tip: Right-click any track to listen to the original '
-                'music before deciding what to replace.'
+                'What was done:\n'
+                '✓ Backed up your original game files safely\n'
+                '✓ Extracted Starbound\'s original music\n'
+                '✓ Organized music by biome (surface, underground, core, space)\n'
+                '✓ Created day/night track folders\n\n'
+                'You can now preview original tracks in Replace/Both modes!\n'
+                'Tip: Right-click any track to listen before replacing.'
             )
             self.accept()
         else:
@@ -194,9 +199,14 @@ class VanillaSetupWizard(QDialog):
             self.logger.error(f'Vanilla setup failed: {message}', context='SetupWizard')
             QMessageBox.critical(
                 self,
-                'Oops! Setup Hit a Snag',
-                f'We couldn\'t finish setting up the music. Here\'s why:\n\n{message}\n\n'
-                'Try again, or ask for help if the problem continues.'
+                'Setup Failed',
+                f'We couldn\'t finish setting up the music:\n\n{message}\n\n'
+                'Common fixes:\n'
+                '• Make sure Starbound is installed correctly\n'
+                '• Check that you have enough disk space\n'
+                '• Try running SetupDependencies.bat if FFmpeg is missing\n\n'
+                'For detailed info, check the app logs in:\n'
+                'StarSound/pygui/starsoundlogs/'
             )
             self.setup_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)

@@ -621,20 +621,16 @@ class MainWindow(QMainWindow):
         from utils.random_mod_name import generate_random_mod_name
         
         # Try to load saved mod name from settings, use random if not available
-        saved_mod_name = self.settings.get('last_mod_name', '')
-        name = saved_mod_name if saved_mod_name else generate_random_mod_name()
-        is_auto_generated = not saved_mod_name  # True only if we generated a new name
+        # NOTE: Always start fresh with a new random name on app startup
+        # Users can explicitly load a saved mod via File → Load Mod...
+        saved_mod_name = ''  # Disable auto-loading of last mod on startup
+        name = generate_random_mod_name()
+        is_auto_generated = True  # Always treat as auto-generated on startup
         print('[DEBUG] Generated mod name:', name)
         
-        # 🆕 FIX: ONLY save to settings if we're using a SAVED name from previous session
-        # Don't overwrite with auto-generated names - those are just placeholders until user confirms
-        if saved_mod_name:
-            # Re-persist the saved name (ensures it's still there)
-            self.settings.set('last_mod_name', saved_mod_name)
-            print(f'[PERSIST] Restored last_mod_name from settings: {saved_mod_name}')
-        else:
-            # Auto-generated: don't save yet - this will be saved only when user confirms the name
-            print(f'[PERSIST] Auto-generated name (not saving to settings yet): {name}')
+        # 🆕 FIX: Fresh start on every app launch - always with a random name
+        # Users can load saved mods explicitly via File → Load Mod...
+        print(f'[PERSIST] Auto-generated fresh name on startup: {name}')
         
         # Track the current auto-generated name so we can detect user edits
         self._current_autogen_name = name if is_auto_generated else None

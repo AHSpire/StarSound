@@ -149,16 +149,67 @@ class VanillaSetup:
                     # Fall through to fallback
                     organized_count = 0
             
-            # Fallback: organize all .ogg files into generic location if parsing failed
+            # Fallback: organize all .ogg files into biome folders when biome_tracks.json is missing
             if organized_count == 0:
-                self.logger.log('Using fallback music organization (generic folder)', context='VanillaSetup')
+                self.logger.log('biome_tracks.json missing, using smart fallback organization', context='VanillaSetup')
                 all_ogg_files = list(music_source.glob('*.ogg'))
-                generic_day = self.vanilla_tracks_dir / 'music' / 'day'
-                generic_day.mkdir(parents=True, exist_ok=True)
-                for ogg_file in all_ogg_files:
-                    dest = generic_day / ogg_file.name
-                    shutil.copy2(ogg_file, dest)
-                    organized_count += 1
+                
+                if not all_ogg_files:
+                    self.logger.log('No .ogg files found to organize', context='VanillaSetup')
+                    return True, "No music files found in unpacked assets"
+                
+                # Strategy 1: Check if biome folders already exist (from previous attempts)
+                existing_biomes = [f for f in self.vanilla_tracks_dir.iterdir() 
+                                 if f.is_dir() and f.name not in ['music']]
+                
+                if existing_biomes:
+                    # Populate all existing biome folders with music
+                    self.logger.log(f'Found {len(existing_biomes)} existing biome folders, populating with music', context='VanillaSetup')
+                    for biome_dir in existing_biomes:
+                        day_dir = biome_dir / 'day'
+                        night_dir = biome_dir / 'night'
+                        
+                        day_dir.mkdir(parents=True, exist_ok=True)
+                        night_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Copy all music to day folder (night gets same tracks)
+                        for ogg_file in all_ogg_files:
+                            dest_day = day_dir / ogg_file.name
+                            dest_night = night_dir / ogg_file.name
+                            
+                            if not dest_day.exists():
+                                shutil.copy2(ogg_file, dest_day)
+                                organized_count += 1
+                            if not dest_night.exists():
+                                shutil.copy2(ogg_file, dest_night)
+                else:
+                    # Strategy 2: Create standard biome structure and populate
+                    standard_biomes = ['surface', 'underground', 'core', 'space']
+                    self.logger.log(f'No existing biomes, creating standard biome structure: {standard_biomes}', context='VanillaSetup')
+                    
+                    for biome_name in standard_biomes:
+                        day_dir = self.vanilla_tracks_dir / biome_name / 'day'
+                        night_dir = self.vanilla_tracks_dir / biome_name / 'night'
+                        
+                        day_dir.mkdir(parents=True, exist_ok=True)
+                        night_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Copy all music to both day and night
+                        for ogg_file in all_ogg_files:
+                            dest_day = day_dir / ogg_file.name
+                            dest_night = night_dir / ogg_file.name
+                            
+                            shutil.copy2(ogg_file, dest_day)
+                            shutil.copy2(ogg_file, dest_night)
+                            organized_count += 1
+                    
+                    # Also put music in generic location for safety
+                    generic_day = self.vanilla_tracks_dir / 'music' / 'day'
+                    generic_day.mkdir(parents=True, exist_ok=True)
+                    for ogg_file in all_ogg_files:
+                        dest = generic_day / ogg_file.name
+                        if not dest.exists():
+                            shutil.copy2(ogg_file, dest)
             
             self.logger.log(f'Organized {organized_count} music files', context='VanillaSetup')
             return True, f"Organized {organized_count} music files"
