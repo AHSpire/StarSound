@@ -1,7 +1,7 @@
 # Starbound folder auto-detection utility
 import os
 from pathlib import Path
-from atomicwriter import get_platform, get_default_starbound_path
+from utils.atomicwriter import get_platform, get_default_starbound_path
 
 def find_steam_install():
     plat = get_platform()

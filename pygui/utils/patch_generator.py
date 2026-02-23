@@ -40,6 +40,11 @@ def get_all_biomes_by_category() -> list:
     Returns a flat list of (category, biome) tuples for ALL biomes.
     Dynamically loads from biome_tracks.json to stay current.
     Example: [('surface', 'forest'), ('underground', 'underground0a'), ...]
+    
+    NOTE: biome_tracks.json is maintained via scripts/regenerate_biome_tracks.py
+    To update with new Starbound biomes, run:
+        python scripts/regenerate_biome_tracks.py <starbound_unpacked_path> pygui/vanilla_tracks/biome_tracks.json
+    Or on Windows, double-click regenerate_biome_tracks.bat
     """
     try:
         from pathlib import Path
@@ -98,43 +103,95 @@ def get_all_biomes_by_category() -> list:
 
 def get_vanilla_tracks_for_biome(biome_category: str, biome_name: str) -> dict:
     """
-    Loads vanilla tracks for a specific biome.
+    Loads vanilla tracks for a specific biome in the EXACT ORDER from the biome file.
     Returns {'dayTracks': [...], 'nightTracks': [...]}
     
-    Tries two methods:
-    1. First, loads actual files from vanilla_tracks/{category}/{biome}/{day|night}/
-    2. If files don't exist, falls back to track names from biome_tracks.json
+    CRITICAL: Tracks MUST be in original biome file order, not sorted!
+    Order = Array indices. Wrong order = wrong patches!
     
-    This allows showing track info even if users don't have the audio files.
+    Loads from actual .biome JSON file to ensure correct track ordering.
+    Note: .biome files contain // comments which need to be stripped before JSON parsing.
     """
     from pathlib import Path
+    import json
+    import re
+    
+    def strip_json_comments(json_str: str) -> str:
+        """Remove // comments from JSON string while preserving string content"""
+        # Pattern: // followed by anything except newline
+        # But we need to avoid removing // inside strings
+        lines = json_str.split('\n')
+        result = []
+        for line in lines:
+            # Simple approach: find // outside of strings
+            in_string = False
+            escaped = False
+            result_line = []
+            for i, char in enumerate(line):
+                if char == '\\' and in_string:
+                    escaped = not escaped
+                    result_line.append(char)
+                elif char == '"' and not escaped:
+                    in_string = not in_string
+                    result_line.append(char)
+                elif char == '/' and not in_string and i + 1 < len(line) and line[i + 1] == '/':
+                    # Found // outside string, skip to end of line
+                    break
+                else:
+                    escaped = False
+                    result_line.append(char)
+            result.append(''.join(result_line))
+        return '\n'.join(result)
     
     try:
-        # Get vanilla_tracks folder
-        module_dir = Path(__file__).parent.parent  # pygui/
-        vanilla_tracks_dir = module_dir / 'vanilla_tracks'
+        # Try to find the unpacked biome file
+        biome_file_path = None
         
-        # Try Method 1: Load actual files from organized biome folders
-        day_folder = vanilla_tracks_dir / biome_category / biome_name / 'day'
-        night_folder = vanilla_tracks_dir / biome_category / biome_name / 'night'
+        # Multiple possible locations for unpacked Starbound files
+        search_paths = [
+            Path(r'c:\Users\Stephanie\OneDrive\Documents\Original Unpacked Starbound\biomes'),
+            Path(r'c:\Steam\steamapps\common\Starbound\assets\packed.unpacked\biomes'),
+            Path(__file__).parent.parent / 'vanilla_tracks' / 'biome_files'
+        ]
         
-        day_tracks = []
-        if day_folder.exists():
-            day_tracks = sorted([str(f) for f in day_folder.glob('*.ogg')])
+        for search_root in search_paths:
+            if search_root.exists():
+                candidate = search_root / biome_category / f'{biome_name}.biome'
+                if candidate.exists():
+                    biome_file_path = candidate
+                    break
         
-        night_tracks = []
-        if night_folder.exists():
-            night_tracks = sorted([str(f) for f in night_folder.glob('*.ogg')])
-        
-        # If we found files, return them
-        if day_tracks or night_tracks:
+        # If found, load track order from the actual biome file
+        if biome_file_path:
+            with open(biome_file_path, 'r', encoding='utf-8') as f:
+                raw_content = f.read()
+            
+            # Strip comments before parsing JSON
+            clean_json = strip_json_comments(raw_content)
+            biome_json = json.loads(clean_json)
+            
+            day_tracks = []
+            night_tracks = []
+            
+            if 'musicTrack' in biome_json:
+                music_track = biome_json['musicTrack']
+                
+                # Extract in exact order from biome file
+                if 'day' in music_track and 'tracks' in music_track['day']:
+                    day_tracks = [track.split('/')[-1] for track in music_track['day']['tracks']]
+                
+                if 'night' in music_track and 'tracks' in music_track['night']:
+                    night_tracks = [track.split('/')[-1] for track in music_track['night']['tracks']]
+            
             return {
                 'dayTracks': day_tracks,
                 'nightTracks': night_tracks
             }
         
-        # Fallback Method 2: Load track names from biome_tracks.json mapping
-        biome_tracks_file = vanilla_tracks_dir / 'biome_tracks.json'
+        # Fallback: Try to load from biome_tracks.json if biome file not found
+        module_dir = Path(__file__).parent.parent
+        biome_tracks_file = module_dir / 'vanilla_tracks' / 'biome_tracks.json'
+        
         if biome_tracks_file.exists():
             with open(biome_tracks_file, 'r', encoding='utf-8') as f:
                 biome_data = json.load(f)
@@ -143,7 +200,7 @@ def get_vanilla_tracks_for_biome(biome_category: str, biome_name: str) -> dict:
             if biome_key in biome_data:
                 biome_info = biome_data[biome_key]
                 
-                # Return just the track names from the mapping
+                # Return in original order (DO NOT SORT)
                 day_names = [track.split('/')[-1] for track in biome_info.get('day', [])]
                 night_names = [track.split('/')[-1] for track in biome_info.get('night', [])]
                 
@@ -266,9 +323,9 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
         if logger:
             logger.log(f'Both mode: Combining Replace + Add operations for {biome_category}/{biome}', context='PatchGen')
         
-        # Ensure music_replacers folder exists for replaced tracks
-        mod_music_replacers_folder = Path(mod_path) / 'music_replacers'
-        mod_music_replacers_folder.mkdir(parents=True, exist_ok=True)
+        # Ensure music_add_and_replace folder exists for replaced tracks
+        mod_music_add_and_replace_folder = Path(mod_path) / 'music_add_and_replace'
+        mod_music_add_and_replace_folder.mkdir(parents=True, exist_ok=True)
         
         # Ensure music folder exists for added tracks
         mod_music_folder = Path(mod_path) / 'music'
@@ -289,10 +346,10 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
             # If we have a vanilla filename, use it; otherwise use user's filename
             if vanilla_filename:
                 dest_filename = vanilla_filename
-                patch_value = f'/music_replacers/{vanilla_filename}'
+                patch_value = f'/music_add_and_replace/{vanilla_filename}'
             else:
                 dest_filename = normalize_track_path(user_ogg_path)
-                patch_value = f'/music_replacers/{dest_filename}'
+                patch_value = f'/music_add_and_replace/{dest_filename}'
             
             # Copy user's file to mod with vanilla filename
             try:
@@ -303,7 +360,7 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
                     if logger:
                         logger.warn(msg)
                 else:
-                    dest = mod_music_replacers_folder / dest_filename
+                    dest = mod_music_add_and_replace_folder / dest_filename
                     shutil.copy2(src, dest)
                     files_copied.append(f'{dest_filename}')
                     if logger:
@@ -330,10 +387,10 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
             # If we have a vanilla filename, use it; otherwise use user's filename
             if vanilla_filename:
                 dest_filename = vanilla_filename
-                patch_value = f'/music_replacers/{vanilla_filename}'
+                patch_value = f'/music_add_and_replace/{vanilla_filename}'
             else:
                 dest_filename = normalize_track_path(user_ogg_path)
-                patch_value = f'/music_replacers/{dest_filename}'
+                patch_value = f'/music_add_and_replace/{dest_filename}'
             
             # Copy user's file to mod with vanilla filename
             try:
@@ -344,7 +401,7 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
                     if logger:
                         logger.warn(msg)
                 else:
-                    dest = mod_music_replacers_folder / dest_filename
+                    dest = mod_music_add_and_replace_folder / dest_filename
                     shutil.copy2(src, dest)
                     files_copied.append(f'{dest_filename}')
                     if logger:
@@ -558,54 +615,18 @@ def generate_patch(mod_path, config, replace_selections=None, logger=None):
         day_tracks = [normalize_track_path(t) for t in day_tracks_to_add]
         night_tracks = [normalize_track_path(t) for t in night_tracks_to_add]
         
-        # 🆕 NEW: If Add mode AND remove_vanilla_tracks is enabled, generate remove ops FIRST
+        # 🆕 NEW: If Add mode AND remove_vanilla_tracks is enabled, replace vanilla arrays with empty FIRST
         if patch_mode == 'add' and remove_vanilla_tracks:
             if logger:
-                logger.log(f'Attempting to remove vanilla tracks from {biome_category}/{biome} before adding new tracks', context='PatchGen')
+                logger.log(f'Removing vanilla tracks from {biome_category}/{biome}: replacing arrays with empty', context='PatchGen')
             
-            # Get vanilla track count for this biome
-            try:
-                json_file = Path(__file__).parent.parent / 'biome_tracks.json'
-                if json_file.exists():
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        biome_data = json.load(f)
-                    
-                    biome_key = f'{biome_category}/{biome}'
-                    if biome_key in biome_data:
-                        # Remove day tracks (backwards from last to 0)
-                        day_vanilla_tracks = biome_data[biome_key].get('day', [])
-                        if day_vanilla_tracks:
-                            # Generate remove ops BACKWARDS (from last index to 0)
-                            # Note: remove ops don't need a "value" field - it's ignored by RFC 6902
-                            for idx in range(len(day_vanilla_tracks) - 1, -1, -1):
-                                patch_ops.append({
-                                    'op': 'remove',
-                                    'path': f'/musicTrack/day/tracks/{idx}'
-                                })
-                            if logger:
-                                logger.log(f'Generated {len(day_vanilla_tracks)} remove operations for day tracks', context='PatchGen')
-                        else:
-                            if logger:
-                                logger.log(f'No vanilla day tracks to remove for {biome_category}/{biome}', context='PatchGen')
-                        
-                        # Remove night tracks (backwards from last to 0)
-                        night_vanilla_tracks = biome_data[biome_key].get('night', [])
-                        if night_vanilla_tracks:
-                            # Generate remove ops BACKWARDS (from last index to 0)
-                            # Note: remove ops don't need a "value" field - it's ignored by RFC 6902
-                            for idx in range(len(night_vanilla_tracks) - 1, -1, -1):
-                                patch_ops.append({
-                                    'op': 'remove',
-                                    'path': f'/musicTrack/night/tracks/{idx}'
-                                })
-                            if logger:
-                                logger.log(f'Generated {len(night_vanilla_tracks)} remove operations for night tracks', context='PatchGen')
-                        else:
-                            if logger:
-                                logger.log(f'No vanilla night tracks to remove for {biome_category}/{biome}', context='PatchGen')
-            except Exception as e:
-                if logger:
-                    logger.warn(f'Could not load vanilla track counts from biome_tracks.json: {e}')
+            # REPLACE entire day/night track arrays with empty (removes ALL vanilla tracks)
+            # This is the core mechanism: replace all → then add new sequentially
+            patch_ops.append({'op': 'replace', 'path': '/musicTrack/day/tracks', 'value': []})
+            patch_ops.append({'op': 'replace', 'path': '/musicTrack/night/tracks', 'value': []})
+            
+            if logger:
+                logger.log(f'Replaced day/night track arrays with empty arrays', context='PatchGen')
         
         if day_tracks:
             if patch_mode == 'both':

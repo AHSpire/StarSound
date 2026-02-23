@@ -1,10 +1,10 @@
-# StarSound Roadmap 🎵
+# StarSound Roadmap
 
 **A lightweight Python-based music mod generator for Starbound**
 
 ---
 
-## 📊 Project Status
+## Project Status
 
 **Current Phase:** v0.1.0 Pre-Release 
 **Last Updated:** February 2026  
@@ -12,7 +12,7 @@
 
 ---
 
-## ✅ v0.1.0 - Complete Features (RELEASED)
+## v0.1.0 - Complete Features (Pre-Release)
 
 ### Core Music Replacement
 - ✅ Add custom music to any Starbound biome (Add mode)
@@ -67,13 +67,13 @@
 
 ---
 
-## 🔄 v1.0 Current Phase - Testing & Polish
+## 🔄 v0.1.0 Current Phase - Testing & Polish
 
 ### In Progress
 - bugtesting
 - 🔧 Performance optimization
 - 🔧 Converted Ogg size limit (<500MB target)
-- 🔧 UI/UX refinement feedback
+- 🔧 UI/UX refinement
 - 🔧 Documentation polish
 
 ### Known Limitations
@@ -86,7 +86,7 @@
 - ⚠️ **Removal Of Mod from Save - General Case:** Removing any Add/Replace mode music mod from your save will result in the save reverting to playing vanilla tracks.
 - ⚠️ **CRITICAL: Removal Of Mod After Remove Mode - Permanent Data Loss:** If you use Remove mode and later remove/disable the StarSound mod, affected biomes will have NO music (vanilla fallback fails because vanilla tracks were permanently removed from the save). 
   - **Why no recovery?** World states are baked at generation time—patches cannot retroactively modify existing world data.
-  - **The only solution:** Use Terraformer to regenerate affected biomes (exactly like any other music mod conflict).
+  - **The SAFE solution:** Use Terraformer to regenerate affected biomes (exactly like any other music mod conflict).
   - **Recommendation:** Only use Remove mode if you plan to keep that mod installed indefinitely. For safer behavior, use Replace mode instead (overwrites vanilla but keeps fallback data intact).
 
 ---
@@ -107,9 +107,16 @@
 - 🎨 Keyboard shortcuts (more of them)
 - 🎨 Mod Templates
 
-### Additional Music/Sound Customization ###
+### Additional Music Customization ###
 - Ambient tracks
-- Combat/Boss music
+- Combat/Boss music (tied to combat dungeon/biomes currently)
+
+### Advanced Audio Configuration (v1.5)
+- ⚙️ **Audio Transition Tweaking** - Customize music fade times and switch grace periods
+  - Located in: `<Starbound>/interface.config`
+  - Settings: `musicTrackSwitchGrace`, `musicTrackFadeInTime`, `ambientTrackSwitchGrace`, `ambientTrackFadeInTime`
+  - Allows modders to fine-tune how quickly music transitions occur
+  - ⚠️ Advanced feature (requires direct config editing)
 
 ### Quality of Life
 - 💾 Batch mod generation (multiple collections)
@@ -123,9 +130,8 @@
 ## 🚀 Future Vision (v2.0+ - Exploratory)
 
 ### Advanced Features ⚠️ *Subject to Starbound Engine Capabilities*
-- 🌟 **Playlist Randomization:** Control track play probability (feasible)
+- 🌟 **Playlist Randomization:** Control track play probability (feasible, requires doubling/tripling tracks though)
 - 🌟 **Dynamic Theme Switching:** Apply coordinated day/night music collections with one click (likely)
-- 🌟 **Contextual Music:** Weather/combat-based music switching (exploring feasibility)
 - 🌟 **Ambient Mixing:** Blend music with location ambience (exploring feasibility)
 
 ### Community Features
@@ -135,10 +141,10 @@
 - 👥 Extended mod validation (advanced compatibility scenarios)
 
 ### Technical Enhancements
-- ⚙️ Multi-threaded conversion (faster batch processing)
 - ⚙️ GPU acceleration for audio processing
 - ⚙️ Cloud sync for mod collections
 - ⚙️ Alternative audio codecs (Opus, etc.)
+
 
 ---
 
@@ -155,9 +161,9 @@
 
 ## 📚 Documentation
 
-- **[TRACK_SPLITTING_WORKFLOW.md](./TRACK_SPLITTING_WORKFLOW.md)** - How track splitting works
-- **[BOTH_MODE_IMPLEMENTATION_PLAN.md](./BOTH_MODE_IMPLEMENTATION_PLAN.md)** - Replace + Add combination mode
-- **[SAVE_ARCHITECTURE.md](./SAVE_ARCHITECTURE.md)** - State persistence system
+- **[BOTH_MODE_IMPLEMENTATION.md](./docs/architecture/BOTH_MODE_IMPLEMENTATION.md)** - Complete technical reference for Both Mode
+- **[TRACK_SPLITTING_WORKFLOW.md](./docs/guides/TRACK_SPLITTING_WORKFLOW.md)** - How track splitting works
+- **[SAVE_ARCHITECTURE.md](./docs/architecture/SAVE_ARCHITECTURE.md)** - State persistence system
 
 ---
 
@@ -201,7 +207,7 @@
 - **Stability** - No crashes, comprehensive error handling
 - **Simplicity** - Intuitive workflows, minimal learning curve
 - **Elegance** - Easy to understand code, zero CPU waste, RFC 6902 standards
-- **Community** - Making Starbound even better with easy custom music for everyone
+- **Community** - Making Starbound even better with easy custom music tracklists for everyone
 
 ---
 
@@ -209,7 +215,7 @@
 
 - 🐛 **Bug Reports:** GitHub Issues
 - 💡 **Feature Requests:** GitHub Discussions
-- 📖 **Documentation:** See Readme and [TROUBLESHOOTING_GUIDE.md](./TROUBLESHOOTING_GUIDE.md)
+- 📖 **Documentation:** See Readme and [TROUBLESHOOTING_GUIDE.md](./docs/TROUBLESHOOTING_GUIDE.md)
 - 💬 **Community Chat:** Discord (TBD)
 
 ---

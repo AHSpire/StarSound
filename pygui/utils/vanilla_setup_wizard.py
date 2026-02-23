@@ -10,6 +10,7 @@ from PyQt5.QtGui import QFont
 from pathlib import Path
 from utils.vanilla_setup import VanillaSetup
 from utils.logger import get_logger
+from dialogs.help_window import HelpWindow
 
 
 class UnpackWorker(QThread):
@@ -41,14 +42,21 @@ class VanillaSetupWizard(QDialog):
     def __init__(self, parent=None, starbound_path: str = None, starsound_dir: str = None):
         super().__init__(parent)
         self.setWindowTitle('StarSound - Vanilla Track Setup')
+        self.setModal(True)
+        # Explicitly disable Windows help button hint
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setMinimumWidth(600)
         self.setMinimumHeight(400)
-        self.starbound_path = starbound_path
-        self.starsound_dir = starsound_dir
-        self.logger = get_logger()
-        self.worker = None
         
         self.init_ui()
+    
+    def show_help(self):
+        """Open the help dialog showing vanilla tracks information."""
+        try:
+            help_dialog = HelpWindow(self, 'vanilla_tracks')
+            help_dialog.exec_()
+        except Exception as e:
+            QMessageBox.warning(self, 'Help Error', f'Could not open help:\n{str(e)}')
     
     def init_ui(self):
         """Build the wizard UI"""
@@ -117,6 +125,13 @@ class VanillaSetupWizard(QDialog):
         )
         self.cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(self.cancel_btn)
+        
+        help_btn = QPushButton('?')
+        help_btn.setMaximumWidth(40)
+        help_btn.setToolTip('Show help for vanilla track setup')
+        help_btn.setStyleSheet('background-color: #3a5a7a; color: #e6ecff; border-radius: 4px; padding: 6px; font-weight: bold; font-size: 14px;')
+        help_btn.clicked.connect(self.show_help)
+        button_layout.addWidget(help_btn)
         
         layout.addLayout(button_layout)
         

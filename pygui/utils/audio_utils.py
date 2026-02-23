@@ -9,11 +9,21 @@ def sanitize_filename(name: str) -> str:
     - Removes special characters (letters, numbers, underscores only)
     - Collapses multiple underscores
     - Strips leading/trailing underscores
+    - Falls back to hash if result is empty (handles Unicode-only filenames like Japanese)
     """
     sanitized = name.replace(' ', '_').replace('.', '_').replace('-', '_')
     sanitized = re.sub(r'[^a-zA-Z0-9_]', '', sanitized)
     sanitized = re.sub(r'_+', '_', sanitized)
-    return sanitized.lower().strip('_')
+    sanitized = sanitized.lower().strip('_')
+    
+    # EDGE CASE: If sanitization results in empty string (all special characters),
+    # use hash of original name to preserve uniqueness
+    if not sanitized:
+        import hashlib
+        name_hash = hashlib.md5(name.encode('utf-8')).hexdigest()[:8]
+        sanitized = f'track_{name_hash}'
+    
+    return sanitized
 
 import os
 import subprocess
@@ -48,7 +58,7 @@ def convert_to_wav(input_path, output_path):
     try:
         # Lower volume by 50% using ffmpeg's volume filter
         cmd = [ffmpeg_path, '-y', '-i', input_path, '-filter:a', 'volume=0.3', output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
         if result.returncode == 0:
             return True, f"Converted to {output_path} (volume reduced)"
         else:
@@ -118,7 +128,7 @@ def validate_file_duration(file_path, max_minutes=30):
         result = subprocess.run([
             ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, encoding='utf-8', errors='replace', check=True)
         duration = float(result.stdout.strip())
         duration_minutes = duration / 60
         if duration_minutes > max_minutes:
@@ -143,7 +153,7 @@ def get_audio_duration(file_path):
         result = subprocess.run([
             ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, encoding='utf-8', errors='replace', check=True)
         
         duration_seconds = float(result.stdout.strip())
         duration_minutes = duration_seconds / 60.0
@@ -260,7 +270,7 @@ def split_audio_file(file_path: str, segment_length_minutes: int = 25, logger=No
         ]
         
         log_msg(f'Running FFmpeg: {" ".join(cmd[:5])}...')
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # 10-minute timeout
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)  # 10-minute timeout
         
         if result.returncode != 0:
             return {
@@ -345,7 +355,7 @@ def validate_file_format(file_path):
             ffprobe_path, '-v', 'error', '-select_streams', 'a:0',
             '-show_entries', 'stream=codec_name,sample_rate',
             '-of', 'default=noprint_wrappers=1', file_path
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, encoding='utf-8', errors='replace', check=True)
         lines = result.stdout.splitlines()
         codec = None
         sample_rate = None
@@ -388,7 +398,7 @@ def check_audio_quality(file_path):
             '-'
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         output = result.stderr  # ffmpeg stats go to stderr
         
         # Parse for peak values
@@ -470,7 +480,7 @@ def parse_time_string(time_str: str) -> float:
     except (ValueError, IndexError, AttributeError):
         return 0.0
 
-def build_audio_filter_chain(audio_processing_options: dict) -> str:
+def build_audio_filter_chain(audio_processing_options: dict, file_duration_minutes: float = None) -> str:
     """
     Constructs FFmpeg audio filter chain based on selected processing options.
     Filters applied in professional mastering order:
@@ -497,8 +507,10 @@ def build_audio_filter_chain(audio_processing_options: dict) -> str:
             - stereo_to_mono (bool)
             - fade (bool)
             - fade_in_duration (float) - seconds
-            - fade_out_start (float) - when to begin fade in seconds
+            - fade_out_start (float) - when to begin fade in seconds (optional)
             - fade_out_duration (float) - how long fade takes in seconds
+        file_duration_minutes: Optional file duration in minutes. If provided and fade_out_start is not set,
+                            calculates fade_out_start = duration - fade_out_duration (for segment-based fading)
     
     Returns: FFmpeg filter chain string (empty if no processing selected)
     """
@@ -636,24 +648,42 @@ def build_audio_filter_chain(audio_processing_options: dict) -> str:
     
     # Stage 10: Fade In/Out (applied last for smooth envelope)
     # NOTE: Starbound has a 30-minute max track length limit. Longer tracks can crash the game.
-    # Default: fade-in 0.5s (quick entry) + fade-out 30m (smooth Starbound transition).
     if audio_processing_options.get('fade'):
         fade_in = audio_processing_options.get('fade_in_duration', '0hr0m0.5s')
-        fade_out_start = audio_processing_options.get('fade_out_start', '0hr30m0s')  # When to begin fading
         fade_out_duration = audio_processing_options.get('fade_out_duration', '0hr0m5s')  # How long fade takes
+        
+        # Calculate fade_out_start from file_duration if not explicitly provided
+        if 'fade_out_start' in audio_processing_options:
+            fade_out_start = audio_processing_options.get('fade_out_start')
+        elif file_duration_minutes is not None:
+            # CRITICAL FIX: Calculate when to start fade based on ACTUAL file duration
+            # fade_out_start = file_duration - fade_out_duration
+            try:
+                fade_out_duration_sec = parse_time_string(str(fade_out_duration))
+                file_duration_sec = file_duration_minutes * 60  # Convert minutes to seconds
+                fade_out_start = max(0, file_duration_sec - fade_out_duration_sec)  # Start time for fade
+            except (ValueError, TypeError):
+                # Fall back to default if calculation fails
+                fade_out_start = '0hr30m0s'
+        else:
+            # No file duration provided, use default (30 min as Starbound max)
+            fade_out_start = '0hr30m0s'
+        
         try:
             # Parse time strings (supports "0hr30m0s" or simple "0.5" format)
             fade_in = parse_time_string(str(fade_in))
-            fade_out_start = parse_time_string(str(fade_out_start))
+            if isinstance(fade_out_start, str):
+                fade_out_start = parse_time_string(str(fade_out_start))
             fade_out_duration = parse_time_string(str(fade_out_duration))
             
             # LOG: Show fade parameters for debugging
-            print(f"[AUDIO TOOLS DEBUG] Fade settings: in={fade_in}s, out_start={fade_out_start}s, out_duration={fade_out_duration}s")
+            print(f"[AUDIO TOOLS DEBUG] Fade settings: in={fade_in}s, out_start={fade_out_start}s, out_duration={fade_out_duration}s, file_duration={file_duration_minutes}min")
             
             filters.append(f'afade=t=in:st=0:d={fade_in}')
             filters.append(f'afade=t=out:st={fade_out_start}:d={fade_out_duration}')
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
             # Invalid fade duration, skip fades
+            print(f"[AUDIO TOOLS DEBUG] Fade parsing error: {e}")
             pass
     
     # Join all filters with commas
@@ -702,7 +732,7 @@ def convert_to_ogg(input_path, output_path, bitrate='192k', audio_filter='', log
         cmd.append(output_path)
         
         if log_callback:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
             for line in process.stdout:
                 # Suppress non-critical FFmpeg warnings about clipping
                 # These are now handled by the pre-limiter stage in the filter chain
@@ -715,7 +745,7 @@ def convert_to_ogg(input_path, output_path, bitrate='192k', audio_filter='', log
             else:
                 return False, f"ffmpeg error: nonzero exit code {returncode}"
         else:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
             if result.returncode == 0:
                 return True, f"Converted to {output_path}"
             else:

@@ -103,11 +103,12 @@ import sys
 import os
 import math
 import random
+import webbrowser
 from pathlib import Path
 from functools import partial
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QFileDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QMenuBar, QAction, QToolBar, QWidgetAction, QStackedLayout, QTextEdit, QDialog, QListWidget, QListWidgetItem, QButtonGroup, QRadioButton, QInputDialog, QComboBox, QCheckBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QFileDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QMenuBar, QAction, QToolBar, QWidgetAction, QStackedLayout, QTextEdit, QDialog, QListWidget, QListWidgetItem, QButtonGroup, QRadioButton, QInputDialog, QComboBox, QCheckBox, QProgressBar
 from PyQt5.QtGui import QPainter, QColor, QLinearGradient, QBrush, QFont
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, QCoreApplication
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 from utils.patch_generator import generate_patch, get_all_biomes_by_category
@@ -117,14 +118,19 @@ from utils.starbound_locator import get_mods_folder, get_storage_folder
 from utils.screenshot_manager import take_screenshot
 from utils.settings_manager import SettingsManager
 from utils.mod_save_manager import ModSaveManager
+from utils.stylesheet_manager import apply_global_stylesheet, get_toolbar_style
 from utils import emergency_beacon
-from replace_tracks_dialog import ReplaceTracksDialog
-from audio_processing_dialog import AudioProcessingDialog
-from per_track_audio_config_dialog import PerTrackAudioConfigDialog
+from dialogs.replace_tracks_dialog import ReplaceTracksDialog
+from dialogs.audio_processing_dialog import AudioProcessingDialog
+from dialogs.per_track_audio_config_dialog import PerTrackAudioConfigDialog
+from dialogs.split_progress_dialog import SplitProgressDialog
+from dialogs.split_preview_dialog import SplitPreviewDialog
+from dialogs.help_window import HelpWindow
 
 class EmergencyBeaconDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setWindowTitle('Emergency Beacon - Log Analyzer')
         # Make the Emergency Beacon window large by default
         self.setGeometry(100, 100, 1100, 900)
@@ -218,9 +224,43 @@ class EmergencyBeaconDialog(QDialog):
         self.show_status(f'Found {len(crit)} critical, {len(benign)} benign errors.')
 
 
+class SplitAudioWorker(QThread):
+    """Worker thread for non-blocking audio splitting with large files."""
+    finished = pyqtSignal(dict)  # Emit split results data
+    progress_update = pyqtSignal(str, int, int)  # filename, current_file_num, total_files
+    error = pyqtSignal(str)
+    
+    def __init__(self, main_window, segment_length, files_to_split):
+        super().__init__()
+        self.main_window = main_window
+        self.segment_length = segment_length
+        self.files_to_split = files_to_split
+        self.split_results = {}  # Accumulate results
+    
+    def run(self):
+        """Run audio splitting in background thread."""
+        try:
+            # Call the actual splitting logic (no dialogs created here)
+            results = self.main_window._perform_file_splitting_worker(
+                self.segment_length,
+                self.files_to_split,
+                progress_callback=self._emit_progress
+            )
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(f"Audio splitting failed: {str(e)}")
+    
+    def _emit_progress(self, filename, current_num, total_num):
+        """Emit progress signal - called from worker thread."""
+        self.progress_update.emit(filename, current_num, total_num)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        # Explicitly disable Windows native help button on main window
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         
         # Initialize settings manager early
         starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
@@ -254,6 +294,7 @@ class MainWindow(QMainWindow):
         self.night_tracks = []  # Legacy: for backward compat, derived from add_selections
         self.files_needing_split = {}  # Track files >30 min: {file_path: duration_minutes}
         self.split_decisions = {}  # Track user split decisions: {file_path: "ACCEPT" | "DENY"}
+        self._skip_config_restore = False  # Flag to prevent loading old config when starting fresh mod
         self.replace_was_selected = False  # Track if Replace mode was ever selected - permanently hides Step 6
         self.crt_effects_enabled = self.settings.get('crt_effects_enabled', False)  # Load saved CRT preference
         print(f'[CRT DEBUG] CRT Effects loaded from settings on startup: {self.crt_effects_enabled}')
@@ -334,11 +375,27 @@ class MainWindow(QMainWindow):
         browse_saves_action.triggered.connect(self.on_browse_mod_saves)
         file_menu.addAction(browse_saves_action)
         
-        # Help Menu
-        help_menu = menubar.addMenu('Help')
-        shortcuts_action = QAction('Shortcuts', self)
+        # Info Menu
+        info_menu = menubar.addMenu('Info')
+        
+        # Guide action - opens comprehensive help system
+        guide_action = QAction('📖 Guide && Documentation', self)
+        guide_action.setToolTip('Open comprehensive help and documentation')
+        def show_guide():
+            try:
+                help_dialog = HelpWindow(self, 'intro')
+                help_dialog.exec_()
+            except Exception as e:
+                QMessageBox.warning(self, 'Help Error', f'Could not open help:\n{str(e)}')
+        guide_action.triggered.connect(show_guide)
+        info_menu.addAction(guide_action)
+        
+        info_menu.addSeparator()
+        
+        shortcuts_action = QAction('⌨️ Keyboard Shortcuts', self)
         def show_shortcuts():
             dlg = QDialog(self)
+            dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
             dlg.setWindowTitle('Keyboard Shortcuts')
             dlg.setMinimumSize(400, 260)
             layout = QVBoxLayout(dlg)
@@ -360,11 +417,26 @@ class MainWindow(QMainWindow):
             ''')
             layout.addWidget(label)
             close_btn = QPushButton('Close')
+            close_btn.setToolTip('Close this shortcuts guide')
             close_btn.clicked.connect(dlg.accept)
             layout.addWidget(close_btn)
             dlg.exec_()
         shortcuts_action.triggered.connect(show_shortcuts)
-        help_menu.addAction(shortcuts_action)
+        info_menu.addAction(shortcuts_action)
+        
+        info_menu.addSeparator()
+        
+        # GitHub Issues action - opens issue tracker in browser
+        github_action = QAction('🐛 Report || Suggest (GitHub)', self)
+        github_action.setToolTip('Report bugs or suggest features on GitHub')
+        def open_github_issues():
+            try:
+                webbrowser.open('https://github.com/AHSpire/StarSound/issues')
+            except Exception as e:
+                QMessageBox.warning(self, 'Browser Error', f'Could not open GitHub issues page:\n{str(e)}')
+        github_action.triggered.connect(open_github_issues)
+        info_menu.addAction(github_action)
+        
         # Add a 'CRT Effects' menu with a toggle action for accessibility
         # Note: crt_effects_enabled was already loaded from settings on line 264
         crt_menu = menubar.addMenu('CRT Effects')
@@ -450,9 +522,7 @@ class MainWindow(QMainWindow):
         config_health_action.setToolTip('Check Starbound config health')
         config_health_action.triggered.connect(lambda: [self.play_click_sound(), self.show_config_health_checker()])
         toolbar.addAction(config_health_action)
-        # Set toolbar action colors (font inherited from global stylesheet)
-        toolbar.setStyleSheet('QToolBar { color: #e6ecff; font-size: 15px; }'
-                     'QToolButton { color: #e6ecff; font-size: 15px; }')
+        # QToolBar styling is handled by global stylesheet (stylesheet_manager.py)
 
         emergency_beacon_action = QAction('🚨 Emergency Beacon', self)
         emergency_beacon_action.setToolTip('Scan Starbound logs for errors and explanations')
@@ -464,7 +534,21 @@ class MainWindow(QMainWindow):
         audio_config_action.setToolTip('Configure audio processing settings:\n✓ Compression • EQ • Normalization • Fade • and more!\n✓ Genre-specific presets available')
         audio_config_action.triggered.connect(lambda: [self.play_click_sound(), self.show_audio_config_dialog()])
         toolbar.addAction(audio_config_action)
-
+        
+        # Help button - opens comprehensive guide
+        help_action = QAction('🛟 Help', self)
+        help_action.setToolTip('Open StarSound guide and documentation')
+        def show_main_help():
+            try:
+                help_dialog = HelpWindow(self, 'intro')
+                help_dialog.exec_()
+            except Exception as e:
+                QMessageBox.warning(self, 'Help Error', f'Could not open help:\n{str(e)}')
+        help_action.triggered.connect(show_main_help)
+        toolbar.addAction(help_action)
+        
+        # Apply toolbar stylesheet for proper button styling and hover/pressed states
+        toolbar.setStyleSheet(get_toolbar_style())
         self.addToolBar(Qt.TopToolBarArea, toolbar)
 
         # Central widget and scroll area (QWidget as central, scroll area inside)
@@ -527,7 +611,7 @@ class MainWindow(QMainWindow):
         modfolder_row.addWidget(self.folder_input)
         modfolder_row.addWidget(self.browse_btn)
         # --- Import atomicwriter for staging save ---
-        from atomicwriter import save_mod_to_staging
+        from utils.atomicwriter import save_mod_to_staging
         from utils.random_mod_name import generate_random_mod_name
         
         # Try to load saved mod name from settings, use random if not available
@@ -536,9 +620,15 @@ class MainWindow(QMainWindow):
         is_auto_generated = not saved_mod_name  # True only if we generated a new name
         print('[DEBUG] Generated mod name:', name)
         
-        # IMMEDIATE PERSISTENCE: Save the initial mod name to settings
-        print(f'[PERSIST] Saving initial mod name to settings: {name}')
-        self.settings.set('last_mod_name', name)
+        # 🆕 FIX: ONLY save to settings if we're using a SAVED name from previous session
+        # Don't overwrite with auto-generated names - those are just placeholders until user confirms
+        if saved_mod_name:
+            # Re-persist the saved name (ensures it's still there)
+            self.settings.set('last_mod_name', saved_mod_name)
+            print(f'[PERSIST] Restored last_mod_name from settings: {saved_mod_name}')
+        else:
+            # Auto-generated: don't save yet - this will be saved only when user confirms the name
+            print(f'[PERSIST] Auto-generated name (not saving to settings yet): {name}')
         
         # Track the current auto-generated name so we can detect user edits
         self._current_autogen_name = name if is_auto_generated else None
@@ -601,7 +691,7 @@ class MainWindow(QMainWindow):
                 self.settings.set('last_mod_name', new_name)
             
             # NEW: When mod name changes, attempt to restore from that mod's saved config
-            if new_name and new_name != 'blank_mod':
+            if new_name and new_name != 'blank_mod' and not self._skip_config_restore:
                 print(f'[PERSIST] Mod name changed to: {new_name}')
                 # Try to restore from the new mod name
                 config = self.mod_save_manager.load_mod(new_name + '.json')
@@ -612,6 +702,12 @@ class MainWindow(QMainWindow):
                     self.night_tracks = config.get('night_tracks', [])
                     self.add_selections = config.get('add_selections', {})  # Restore per-biome Add selections (NEW)
                     self.selected_biomes = config.get('selected_biomes', [])
+                    
+                    # Sync: if add_selections has biomes but selected_biomes is empty, populate it
+                    if self.add_selections and not self.selected_biomes:
+                        self.selected_biomes = list(self.add_selections.keys())
+                        print(f'[PERSIST] Synced selected_biomes from add_selections during mod name change')
+                    
                     self.patch_mode = config.get('patch_mode', None)
                     # If we're restoring a saved patch_mode, mark it as confirmed (was confirmed in previous session)
                     if config.get('patch_mode'):
@@ -636,6 +732,19 @@ class MainWindow(QMainWindow):
                     self.selected_track_type = None
                     self.update_selected_tracks_label()
                     self.update_patch_btn_state()
+            elif self._skip_config_restore:
+                print(f'[PERSIST] Skipping config restore (within "New Mod" session), clearing UI')
+                # Fresh start - clear everything
+                self.day_tracks = []
+                self.night_tracks = []
+                self.add_selections = {}
+                self.selected_biomes = []
+                self.patch_mode = None
+                self._mode_confirmed_this_session = False
+                self.replace_selections = {}
+                self.selected_track_type = None
+                self.update_selected_tracks_label()
+                self.update_patch_btn_state()
             
             QLineEdit.focusOutEvent(self.modname_input, event)
         self.modname_input.focusOutEvent = on_modname_focus_out
@@ -651,8 +760,37 @@ class MainWindow(QMainWindow):
         # Patch dice_btn click to use set_autofill_name
         def roll_mod_name():
             self.play_click_sound()
+            
+            # SAFETY CHECK: If current mod name exists in staging, warn user
+            current_name = self.modname_input.text().strip()
+            if current_name:
+                from pathlib import Path
+                starsound_dir = Path(__file__).parent.parent
+                staging_dir = starsound_dir / 'staging'
+                current_mod_path = staging_dir / current_name
+                
+                if current_mod_path.exists():
+                    # Current mod is saved - warn before rolling new name
+                    reply = QMessageBox.warning(
+                        self,
+                        '⚠️ Existing Mod Detected',
+                        f'You have an existing mod named "{current_name}" in staging.\n\n'
+                        f'Rolling a new random name will create a NEW mod, abandoning the current one.\n\n'
+                        f'Are you sure you want to continue?',
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No  # Default to NO (safe default)
+                    )
+                    
+                    if reply != QMessageBox.Yes:
+                        return  # User cancelled - don't change the name
+            
+            # Safe to roll - generate new name
             from utils.random_mod_name import generate_random_mod_name
             new_name = generate_random_mod_name()
+            
+            # SAFETY: Uncheck the confirmation checkbox to prevent accidental saves
+            self.modname_confirm_checkbox.setChecked(False)
+            
             set_autofill_name(new_name)
         # Add dice icon next to Mod Name, visually grouped
         print(f'[DEBUG] Starting dice icon setup')
@@ -703,6 +841,9 @@ class MainWindow(QMainWindow):
                 print(f'[PERSIST] Saved to staging')
                 self.settings.set('last_mod_name', current_name)  # Save to persistent settings
                 print(f'[PERSIST] Saved to settings.json: last_mod_name={current_name}')
+                # Allow normal config restore on future name changes (fresh start is done)
+                self._skip_config_restore = False
+                print(f'[PERSIST] Reset _skip_config_restore flag - normal mode restore enabled')
             else:
                 # User unchecks - allow editing
                 self.modname_input.setReadOnly(False)
@@ -727,8 +868,37 @@ class MainWindow(QMainWindow):
         
         def roll_mod_name():
             self.play_click_sound()
+            
+            # SAFETY CHECK: If current mod name exists in staging, warn user
+            current_name = self.modname_input.text().strip()
+            if current_name:
+                from pathlib import Path
+                starsound_dir = Path(__file__).parent.parent
+                staging_dir = starsound_dir / 'staging'
+                current_mod_path = staging_dir / current_name
+                
+                if current_mod_path.exists():
+                    # Current mod is saved - warn before rolling new name
+                    reply = QMessageBox.warning(
+                        self,
+                        '⚠️ Existing Mod Detected',
+                        f'You have an existing mod named "{current_name}" in staging.\n\n'
+                        f'Rolling a new random name will create a NEW mod, abandoning the current one.\n\n'
+                        f'Are you sure you want to continue?',
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No  # Default to NO (safe default)
+                    )
+                    
+                    if reply != QMessageBox.Yes:
+                        return  # User cancelled - don't change the name
+            
+            # Safe to roll - generate new name
             from utils.random_mod_name import generate_random_mod_name
             new_name = generate_random_mod_name()
+            
+            # SAFETY: Uncheck the confirmation checkbox to prevent accidental saves
+            self.modname_confirm_checkbox.setChecked(False)
+            
             set_autofill_name(new_name)
         dice_btn.clicked.connect(roll_mod_name)
         # Group icon, checkbox, and input in a horizontal layout
@@ -770,6 +940,7 @@ class MainWindow(QMainWindow):
         self.audio_browse_btn.clicked.connect(lambda: [self.play_click_sound(), self.browse_audio()])
         audio_grid.addWidget(self.audio_browse_btn, 0, 1)
         self.audio_clear_btn = QPushButton('Clear Selected Files')
+        self.audio_clear_btn.setToolTip('Remove all selected audio files and start over')
         self.audio_clear_btn.clicked.connect(lambda: [self.play_click_sound(), self.clear_audio()])
         audio_grid.addWidget(self.audio_clear_btn, 0, 2)
 
@@ -783,6 +954,7 @@ class MainWindow(QMainWindow):
         # ===== CONVERT TO OGG BUTTON =====
         audio_btn_row = QHBoxLayout()
         self.convert_audio_btn = QPushButton('Step 4: Convert to OGG')
+        self.convert_audio_btn.setToolTip('Convert selected audio files to OGG format for Starbound compatibility')
         self.convert_audio_btn.clicked.connect(lambda: [self.play_click_sound(), self.convert_audio()])
         audio_btn_row.addWidget(self.convert_audio_btn)
         scroll_layout.addLayout(audio_btn_row)
@@ -1001,12 +1173,33 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'step6_widget') and self.step6_widget:
             scroll_layout.addWidget(self.step6_widget)
         
+        # Create "View All Tracks" button (SEPARATE from Step 6, so it's visible in Replace mode)
+        self.view_tracks_btn = QPushButton('📋 View All Tracks')
+        self.view_tracks_btn.setToolTip('Open a detailed view of all selected tracks and their assignments')
+        self.view_tracks_btn.setMinimumHeight(32)
+        self.view_tracks_btn.setStyleSheet('''QPushButton {
+            background-color: #3a6ea5;
+            color: #e6ecff;
+            border-radius: 8px;
+            font-size: 12px;
+            padding: 8px;
+            margin-top: 4px;
+        }
+        QPushButton:hover {
+            background-color: #4e8cff;
+            border: 1px solid #6bbcff;
+        }
+        ''')
+        self.view_tracks_btn.clicked.connect(self._open_tracks_viewer)
+        scroll_layout.addWidget(self.view_tracks_btn)
+        
         # Format selection moved to dialog on Generate button click (not in main UI)
         # This prevents users from accidentally skipping the format choice
         
         # Create patch button FIRST (before restore) so button state can be updated
         btn_row = QHBoxLayout()
         self.patch_btn = QPushButton('Final Step: Generate Mod')
+        self.patch_btn.setToolTip('Generate the mod file with all your selected music and settings')
         self.patch_btn.setStyleSheet('''QPushButton {
             background-color: #3a6ea5;
             color: #e6ecff;
@@ -1124,9 +1317,33 @@ class MainWindow(QMainWindow):
         step6_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         layout.addWidget(step6_label, alignment=Qt.AlignHCenter)
         day_btn = QPushButton('Add to Day')
+        day_btn.setToolTip('Select music tracks to play during daytime')
         night_btn = QPushButton('Add to Night')
-        day_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; border-radius: 8px; font-size: 13px; margin: 4px 8px 4px 0;')
-        night_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; border-radius: 8px; font-size: 13px; margin: 4px 0 4px 0;')
+        night_btn.setToolTip('Select music tracks to play during nighttime')
+        day_btn.setStyleSheet('''QPushButton {
+            background-color: #3a6ea5;
+            color: #e6ecff;
+            border-radius: 8px;
+            font-size: 13px;
+            margin: 4px 8px 4px 0;
+        }
+        QPushButton:hover {
+            background-color: #4e8cff;
+            border: 1px solid #6bbcff;
+        }
+        ''')
+        night_btn.setStyleSheet('''QPushButton {
+            background-color: #3a6ea5;
+            color: #e6ecff;
+            border-radius: 8px;
+            font-size: 13px;
+            margin: 4px 0 4px 0;
+        }
+        QPushButton:hover {
+            background-color: #4e8cff;
+            border: 1px solid #6bbcff;
+        }
+        ''')
         btn_row = QHBoxLayout()
         btn_row.addWidget(day_btn)
         btn_row.addWidget(night_btn)
@@ -1151,12 +1368,6 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(btn_row)
         
-        # Add "View Tracks" button to open the full viewer window
-        view_tracks_btn = QPushButton('📋 View All Tracks')
-        view_tracks_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; border-radius: 8px; font-size: 12px; padding: 8px; margin-top: 4px;')
-        view_tracks_btn.clicked.connect(self._open_tracks_viewer)
-        layout.addWidget(view_tracks_btn)
-        
         layout.addWidget(self.tracks_scroll_area)
         
         # Add biome display label
@@ -1170,8 +1381,11 @@ class MainWindow(QMainWindow):
     
     def _set_step6_visible(self, visible: bool):
         """Show or hide Step 6 based on patch mode"""
-        # Never show Step 6 if Replace was ever selected in this session
-        if self.replace_was_selected:
+        # In Both mode, always show Step 6 (for Day/Night Add selections)
+        if self.patch_mode == 'both':
+            visible = True
+        # In other modes, hide Step 6 if Replace was selected
+        elif self.replace_was_selected:
             visible = False
         
         if hasattr(self, 'step6_widget') and self.step6_widget:
@@ -1198,17 +1412,9 @@ class MainWindow(QMainWindow):
         self.tracks_display_layout.setSpacing(4)
         self.tracks_scroll_area.setWidget(self.tracks_display_widget)
         
-        # Show brief summary instead of full details (click "View All Tracks" for details)
-        if add_selections:
-            total_biomes = len(add_selections)
-            total_tracks = sum(
-                len(v.get('day', [])) + len(v.get('night', []))
-                for v in add_selections.values()
-            )
-            summary_label = QLabel(f'✓ {total_tracks} track(s) in {total_biomes} biome(s)')
-            summary_label.setStyleSheet('color: #00d4ff; font-size: 10px; font-weight: bold;')
-            self.tracks_display_layout.addWidget(summary_label)
-        else:
+        # Note: Track summary is displayed in audio_status_label and selected_biomes_label
+        # This section intentionally kept minimal to avoid redundancy
+        if not add_selections:
             empty_label = QLabel('No tracks selected yet')
             empty_label.setStyleSheet('color: #b19cd9; font-size: 10px; font-style: italic;')
             self.tracks_display_layout.addWidget(empty_label)
@@ -1234,6 +1440,7 @@ class MainWindow(QMainWindow):
         
         # Multiple biomes selected: ask blanket or individual
         dlg = QDialog(self)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dlg.setWindowTitle('How to Add Music')
         dlg.setMinimumSize(400, 200)
         layout = QVBoxLayout(dlg)
@@ -1245,13 +1452,33 @@ class MainWindow(QMainWindow):
         
         # Blanket option
         blanket_btn = QPushButton('🎵 Blanket: Add same tracks to ALL biomes')
-        blanket_btn.setStyleSheet('background-color: #2d5a3d; color: #e6ecff; padding: 8px; border-radius: 4px;')
+        blanket_btn.setToolTip('Use the same music tracks for all selected biomes')
+        blanket_btn.setStyleSheet('''QPushButton {
+            background-color: #2d5a3d;
+            color: #e6ecff;
+            padding: 8px;
+            border-radius: 4px;
+        }
+        QPushButton:hover {
+            background-color: #3a8a55;
+        }
+        ''')
         blanket_btn.clicked.connect(lambda: self._blanket_add_flow(track_type, dlg))
         layout.addWidget(blanket_btn)
         
         # Individual option
         individual_btn = QPushButton('🎯 Individual: Add different tracks to each biome')
-        individual_btn.setStyleSheet('background-color: #3d5a6a; color: #e6ecff; padding: 8px; border-radius: 4px;')
+        individual_btn.setToolTip('Assign different music tracks to different biomes')
+        individual_btn.setStyleSheet('''QPushButton {
+            background-color: #3d5a6a;
+            color: #e6ecff;
+            padding: 8px;
+            border-radius: 4px;
+        }
+        QPushButton:hover {
+            background-color: #4e7a9a;
+        }
+        ''')
         individual_btn.clicked.connect(lambda: self._individual_add_flow(track_type, dlg))
         layout.addWidget(individual_btn)
         
@@ -1282,9 +1509,10 @@ class MainWindow(QMainWindow):
         if files:
             print(f'[ADD] Blanket adding {len(files)} {track_type} tracks to {len(self.selected_biomes)} biomes')
             
-            # Copy files to mod music folder and backup originals
-            originals_folder = staging_dir / safe_mod_name / 'backups' / 'originals'
-            converted_folder = staging_dir / safe_mod_name / 'backups' / 'converted'
+            # Copy files to mod music folder and backup originals (in root backups folder)
+            backup_root = self._get_backup_path(safe_mod_name)
+            originals_folder = backup_root / 'originals'
+            converted_folder = backup_root / 'converted'
             originals_folder.mkdir(parents=True, exist_ok=True)
             converted_folder.mkdir(parents=True, exist_ok=True)
             
@@ -1382,9 +1610,10 @@ class MainWindow(QMainWindow):
             
             key = 'day' if track_type == 'Day' else 'night'
             
-            # Copy files to mod music folder and backup originals
-            originals_folder = staging_dir / safe_mod_name / 'backups' / 'originals'
-            converted_folder = staging_dir / safe_mod_name / 'backups' / 'converted'
+            # Copy files to mod music folder and backup originals (in root backups folder)
+            backup_root = self._get_backup_path(safe_mod_name)
+            originals_folder = backup_root / 'originals'
+            converted_folder = backup_root / 'converted'
             originals_folder.mkdir(parents=True, exist_ok=True)
             converted_folder.mkdir(parents=True, exist_ok=True)
             
@@ -1441,6 +1670,16 @@ class MainWindow(QMainWindow):
             if track_path in self.add_selections[biome][key]:
                 self.add_selections[biome][key].remove(track_path)
                 print(f'[ADD] Removed {track_type} track from {biome}: {Path(track_path).name}')
+                
+                # If biome now has 0 tracks, remove it from add_selections
+                if not self.add_selections[biome]['day'] and not self.add_selections[biome]['night']:
+                    del self.add_selections[biome]
+                    print(f'[ADD] Removed empty biome entry from add_selections: {biome}')
+                    # Also remove from selected_biomes to keep them in sync
+                    if biome in self.selected_biomes:
+                        self.selected_biomes.remove(biome)
+                        print(f'[ADD] Removed {biome} from selected_biomes')
+                
                 self.update_selected_tracks_label()
                 self.update_patch_btn_state()
                 self._auto_save_mod_state(action=f'Removed {track_type} track from {biome[1]}')
@@ -1452,6 +1691,16 @@ class MainWindow(QMainWindow):
             count = len(self.add_selections[biome][key])
             self.add_selections[biome][key].clear()
             print(f'[ADD] Cleared all {count} {track_type} tracks from {biome}')
+            
+            # If biome now has 0 tracks, remove it from add_selections
+            if not self.add_selections[biome]['day'] and not self.add_selections[biome]['night']:
+                del self.add_selections[biome]
+                print(f'[ADD] Removed empty biome entry from add_selections: {biome}')
+                # Also remove from selected_biomes to keep them in sync
+                if biome in self.selected_biomes:
+                    self.selected_biomes.remove(biome)
+                    print(f'[ADD] Removed {biome} from selected_biomes')
+            
             self.update_selected_tracks_label()
             self.update_patch_btn_state()
             self._auto_save_mod_state(action=f'Cleared all {track_type} tracks from {biome[1]}')
@@ -1556,6 +1805,8 @@ class MainWindow(QMainWindow):
     def show_config_health_checker(self):
         from utils import config_health_detailed
         dlg = QDialog(self)
+        # Explicitly disable Windows help button on this dialog
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dlg.setWindowTitle('Config Health Checker')
         dlg.setMinimumSize(1100, 900)
         from utils.starbound_locator import get_storage_folder
@@ -1777,6 +2028,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f'Click sound error: {e}')
 
+    def _get_backup_path(self, mod_name):
+        """Get the backup folder path for a mod (root-level backups)"""
+        starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
+        safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+        backup_dir = starsound_dir / 'backups' / safe_mod_name
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        return backup_dir
+
     def _setup_ui_legacy(self):
         # Load custom font from assets/font/hobo.ttf
         from PyQt5.QtGui import QFontDatabase, QFont
@@ -1866,6 +2125,7 @@ QGroupBox {{
         shortcuts_action = QAction('Shortcuts', self)
         def show_shortcuts():
             dlg = QDialog(self)
+            dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
             dlg.setWindowTitle('Keyboard Shortcuts')
             dlg.setMinimumSize(400, 260)
             layout = QVBoxLayout(dlg)
@@ -1887,6 +2147,7 @@ QGroupBox {{
             ''')
             layout.addWidget(label)
             close_btn = QPushButton('Close')
+            close_btn.setToolTip('Close this shortcuts guide')
             close_btn.clicked.connect(dlg.accept)
             layout.addWidget(close_btn)
             dlg.exec_()
@@ -1927,15 +2188,15 @@ QGroupBox {{
         config_health_action.setToolTip('Check Starbound config health')
         config_health_action.triggered.connect(lambda: [self.play_click_sound(), self.show_config_health_checker()])
         toolbar.addAction(config_health_action)
-        # Set toolbar action colors (font inherited from global stylesheet)
-        toolbar.setStyleSheet('QToolBar { color: #e6ecff; font-size: 15px; }'
-                     'QToolButton { color: #e6ecff; font-size: 15px; }')
+        # QToolBar styling is handled by global stylesheet (stylesheet_manager.py)
 
         emergency_beacon_action = QAction('🚨 Emergency Beacon', self)
         emergency_beacon_action.setToolTip('Scan Starbound logs for errors and explanations')
         emergency_beacon_action.triggered.connect(lambda: [self.play_click_sound(), self.show_emergency_beacon()])
         toolbar.addAction(emergency_beacon_action)
-
+        
+        # Apply toolbar stylesheet for proper button styling and hover/pressed states
+        toolbar.setStyleSheet(get_toolbar_style())
         self.addToolBar(Qt.TopToolBarArea, toolbar)
 
         # RE-APPLY font after all UI widgets are created
@@ -1986,13 +2247,13 @@ QGroupBox {{
         self._mode_confirmed_this_session = True  # Mark that user confirmed mode in THIS session
         self.settings.set('last_patch_mode', 'add')  # Save patch mode to persistent settings
         self._auto_save_mod_state('patch mode: add')
-        self.audio_status_label.setText('✅ Mode: Add to Game (your music added alongside vanilla tracks)')
+        self.audio_status_label.setText('✅ Mode: Add to Game (⭐ Check "Remove vanilla" for safest option, or add alongside vanilla)')
         print(f'[ADD_MODE] Set patch_mode to add and _mode_confirmed_this_session to True')
         
-        # Hide the Replace buttons to prevent mode mixing
+        # Hide the Replace buttons to prevent mode mixing, but keep Add button visible to show current mode
         self.replace_btn.hide()
         self.replace_and_add_btn.hide()
-        print(f'[ADD_MODE] Hid Replace buttons')
+        print(f'[ADD_MODE] Hid Replace buttons - Add mode is now locked in')
         
         # Only show Step 6 if Replace hasn't been selected yet
         if not self.replace_was_selected:
@@ -2079,9 +2340,21 @@ QGroupBox {{
                 self.logger.log(f'Replace selections saved for generate_patch_file()', context='Replace')
                 # Save after selections are made
                 self._auto_save_mod_state('replace track selections')
-                # Show summary of what was replaced
-                self._show_replace_selections_summary()
-                # Save again after summary is confirmed
+                
+                # Show Replace selections in main UI (no dialog)
+                if hasattr(self, 'view_tracks_btn'):
+                    self.view_tracks_btn.show()
+                
+                # Update status label with confirmation
+                biome_count = len(self.replace_selections)
+                total_replacements = sum(
+                    len(d.get('day', {})) + len(d.get('night', {}))
+                    for d in self.replace_selections.values()
+                )
+                status_text = f'✅ {biome_count} biome(s), {total_replacements} replacement(s) ready'
+                self.audio_status_label.setText(status_text)
+                
+                # Save again after selections confirmed
                 self._auto_save_mod_state('replace summary confirmed')
                 # Enable the Generate Mod button since we now have replace_selections and selected_biomes
                 self.update_patch_btn_state()
@@ -2129,6 +2402,7 @@ QGroupBox {{
             
             # Create a large, scalable dialog
             dlg = QDialog(self)
+            dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
             dlg.setWindowTitle('Replace Selections Confirmed')
             dlg.setMinimumSize(1000, 700)  # Large minimum size
             dlg.resize(1000, 700)  # Default size
@@ -2183,7 +2457,28 @@ QGroupBox {{
             # OK button
             btn_layout = QHBoxLayout()
             btn_layout.addStretch()
+            
+            view_btn = QPushButton('📋 View All Tracks')
+            view_btn.setToolTip('Open a detailed view of all replacement selections')
+            view_btn.setMinimumWidth(150)
+            view_btn.setMinimumHeight(40)
+            view_btn.setFont(QFont('Hobo', 12))
+            view_btn.setStyleSheet(
+                'QPushButton { '
+                '  background-color: #3a6ea5; '
+                '  color: #e6ecff; '
+                '  border-radius: 8px; '
+                '  font-weight: bold; '
+                '} '
+                'QPushButton:hover { '
+                '  background-color: #5a8ed5; '
+                '}'
+            )
+            view_btn.clicked.connect(self._open_tracks_viewer)
+            btn_layout.addWidget(view_btn)
+            
             ok_btn = QPushButton('OK')
+            ok_btn.setToolTip('Confirm and close this dialog')
             ok_btn.setMinimumWidth(120)
             ok_btn.setMinimumHeight(40)
             ok_btn.setFont(QFont('Hobo', 13))
@@ -2441,6 +2736,7 @@ QGroupBox {{
         # Show biomes grouped by category for user selection
         biomes = get_all_biomes_by_category()
         dlg = QDialog(self)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dlg.setWindowTitle('Select Biome(s) to Add Music')
         dlg.setMinimumSize(900, 700)
         layout = QVBoxLayout()
@@ -2461,6 +2757,23 @@ QGroupBox {{
         remove_vanilla_layout.setContentsMargins(0, 4, 0, 4)
         
         self.remove_vanilla_checkbox = QCheckBox('🗑️ Remove vanilla tracks first?')
+        self.remove_vanilla_checkbox.setToolTip(
+            '⭐ THE SAFEST && SIMPLEST OPTION FOR MOST PLAYERS\n\n'
+            'Perfect for: Multi-part tracks, album soundtracks, complete theme replacements.\n'
+            'Simplest workflow - just check the box! No need for Replace/Both modes.\n\n'
+            'WHAT HAPPENS if CHECKED:\n'
+            '• ALL vanilla Starbound tracks removed from your chosen biome(s)\n'
+            '• Only your custom music will play (100% guaranteed)\n'
+            '• Game will never play original biome music (even if mod disabled)\n'
+            '• This affects ONLY the selected biome(s)\n\n'
+            'MOD COMPATIBILITY:\n'
+            '✅ Compatible with ADD-based music mods (no conflict)\n'
+            '⚠️ Can conflict with other REPLACE-based mods (same feature level)\n'
+            '   If conflict: disable one mod or adjust mod load order\n\n'
+            'If UNCHECKED (default):\n'
+            '• Your tracks play randomly ALONGSIDE vanilla tracks\n'
+            '• Players hear a mix of ~50-60% vanilla + ~40-50% custom (due to quantity)'
+        )
         self.remove_vanilla_checkbox.setStyleSheet('''
             QCheckBox {
                 color: #ffcc99;
@@ -2490,25 +2803,8 @@ QGroupBox {{
         remove_vanilla_layout.addStretch()
         layout.addLayout(remove_vanilla_layout)
         
-        # Info about what this checkbox does
-        if self.patch_mode == 'add':
-            remove_info = QLabel(
-                'SUGGESTED FOR MULTI-PART TRACKS\n'
-                '\n'
-                '  • Perfect for: Split files (parts 1/2/3 etc), album soundtracks, complete theme replacements.\n'
-                '  • Simpler than Replace/Both modes - just check the box!\n\n'
-                'CONSEQUENCES if checked:\n'
-                '  • ALL vanilla Starbound tracks will be REMOVED from your chosen biome(s)\n'
-                '  • Only your custom music will play in your chosen biome(s)\n'
-                '  • The game will never play original biome music (even if your mod is disabled)\n'
-                '  • This affects ONLY the selected biome(s)\n\n'
-                'If UNCHECKED (default):\n'
-                '  • Your tracks play randomly ALONGSIDE vanilla tracks (Native Starbound Behavior)\n'
-                '  • Players hear a mix of original + custom music'
-            )
-            remove_info.setStyleSheet('color: #ffdd99; font-size: 11px; line-height: 1.5; font-weight: bold;')
-            remove_info.setWordWrap(True)
-            layout.addWidget(remove_info)
+        # Info about what this checkbox does is now in the tooltip (hover over checkbox)
+
         
         # Check if vanilla tracks are available (look for organized biome folders)
         vanilla_tracks_dir = Path(__file__).parent / 'vanilla_tracks'
@@ -2570,8 +2866,29 @@ QGroupBox {{
         tree_widget = PreviewTreeWidget()
         tree_widget.setColumnCount(1)
         tree_widget.setHeaderHidden(True)
-        tree_widget.setStyleSheet('color: white; background-color: #22223a; font-size: 13px;')
-        tree_widget.setSelectionMode(QTreeWidget.MultiSelection)
+        # Enhanced styling for better checkbox visibility and selection
+        tree_widget.setStyleSheet('''
+            QTreeWidget {
+                color: #e6ecff;
+                background-color: #1a1f2e;
+                font-size: 13px;
+                border: 1px solid #3a4a6a;
+                border-radius: 4px;
+            }
+            QTreeWidget::item:hover {
+                background-color: #283046;
+            }
+            QTreeWidget::item:selected {
+                background-color: #3a6ea5;
+                border-left: 3px solid #4e8cff;
+                padding-left: 2px;
+            }
+            QHeaderView::section {
+                background-color: #1a1f2e;
+                color: #e6ecff;
+            }
+        ''')
+        tree_widget.setSelectionMode(QTreeWidget.NoSelection)  # Disable row selection, use checkboxes instead
         
         vanilla_biome_count = 0
         for category, biome in biomes:
@@ -2594,6 +2911,9 @@ QGroupBox {{
             # Create biome as parent item
             biome_item = QTreeWidgetItem([display_text])
             biome_item.setData(0, Qt.UserRole, (category, biome))
+            # Add checkbox for biome selection
+            biome_item.setFlags(biome_item.flags() | Qt.ItemIsUserCheckable)
+            biome_item.setCheckState(0, Qt.Unchecked)
             tree_widget.addTopLevelItem(biome_item)
             
             # If replace mode and has vanilla tracks, add expandable track list
@@ -2603,27 +2923,198 @@ QGroupBox {{
                 night_tracks = vanilla_data.get('nightTracks', [])
                 
                 if day_tracks or night_tracks:
+                    # Get replace_selections for this biome (if Both mode)
+                    replace_selections = getattr(self, 'replace_selections', {})
+                    biome_replace_data = replace_selections.get((category, biome), {}) if self.patch_mode == 'both' else {}
+                    day_replacements = biome_replace_data.get('day', {})  # {index: path_to_custom_ogg}
+                    night_replacements = biome_replace_data.get('night', {})
+                    
                     # Add Day tracks
                     if day_tracks:
                         day_parent = QTreeWidgetItem(biome_item, [f'Day ({len(day_tracks)} tracks)'])
                         day_parent.setForeground(0, QColor('#b19cd9'))  # Light purple
-                        for track_path in day_tracks:
+                        for idx, track_path in enumerate(day_tracks):
                             track_name = track_path.split('\\')[-1] if '\\' in track_path else track_path.split('/')[-1]
-                            track_item = QTreeWidgetItem(day_parent, [f'  • {track_name}'])
-                            track_item.setForeground(0, QColor('#a9a9a9'))  # Gray
+                            
+                            # Check if this track is replaced in Both mode
+                            if self.patch_mode == 'both' and idx in day_replacements:
+                                custom_path = day_replacements[idx]
+                                custom_name = Path(custom_path).name
+                                display_text = f'  • {track_name} → {custom_name}'
+                                track_item = QTreeWidgetItem(day_parent, [display_text])
+                                track_item.setForeground(0, QColor('#ff9999'))  # Red/salmon for replaced
+                            else:
+                                display_text = f'  • {track_name}'
+                                track_item = QTreeWidgetItem(day_parent, [display_text])
+                                track_item.setForeground(0, QColor('#a9a9a9'))  # Gray for vanilla
+                            
                             track_item.setData(0, Qt.UserRole + 1, str(track_path))  # Store file path for playback
                     
                     # Add Night tracks
                     if night_tracks:
                         night_parent = QTreeWidgetItem(biome_item, [f'Night ({len(night_tracks)} tracks)'])
                         night_parent.setForeground(0, QColor('#b19cd9'))  # Light purple
-                        for track_path in night_tracks:
+                        for idx, track_path in enumerate(night_tracks):
                             track_name = track_path.split('\\')[-1] if '\\' in track_path else track_path.split('/')[-1]
-                            track_item = QTreeWidgetItem(night_parent, [f'  • {track_name}'])
-                            track_item.setForeground(0, QColor('#a9a9a9'))  # Gray
+                            
+                            # Check if this track is replaced in Both mode
+                            if self.patch_mode == 'both' and idx in night_replacements:
+                                custom_path = night_replacements[idx]
+                                custom_name = Path(custom_path).name
+                                display_text = f'  • {track_name} → {custom_name}'
+                                track_item = QTreeWidgetItem(night_parent, [display_text])
+                                track_item.setForeground(0, QColor('#ff9999'))  # Red/salmon for replaced
+                            else:
+                                display_text = f'  • {track_name}'
+                                track_item = QTreeWidgetItem(night_parent, [display_text])
+                                track_item.setForeground(0, QColor('#a9a9a9'))  # Gray for vanilla
+                            
                             track_item.setData(0, Qt.UserRole + 1, str(track_path))  # Store file path for playback
         
         logger.log(f'Total biomes with vanilla tracks: {vanilla_biome_count}', context='BiomeDialog')
+        
+        # Function to update item background color based on check state
+        def update_item_background(item):
+            """Set cyan background for checked items, default for unchecked"""
+            if item.checkState(0) == Qt.Checked:
+                item.setBackground(0, QColor('#1a4d6d'))  # Cyan-tinted background
+                item.setForeground(0, QColor('#00ffff'))  # Bright cyan text
+            else:
+                item.setBackground(0, QColor('#1a1f2e'))  # Default dark background
+                item.setForeground(0, QColor('#e6ecff'))  # Default light text
+        
+        # Apply initial styling to all biome items and connect to item changed
+        def on_item_changed(item, column):
+            """Handle checkbox state changes with warning for deselecting filled biomes"""
+            # Only handle top-level biome items
+            if tree_widget.indexOfTopLevelItem(item) < 0:
+                return
+            
+            biome_data = item.data(0, Qt.UserRole)
+            if not biome_data:
+                return
+            
+            # Check if user is UNCHECKING a biome with tracks
+            if item.checkState(0) == Qt.Unchecked:
+                total_tracks = 0
+                day_tracks = []
+                night_tracks = []
+                
+                # Check per-biome selections first
+                if hasattr(self, 'add_selections'):
+                    tracks_in_biome = self.add_selections.get(biome_data, {})
+                    day_tracks_per_biome = tracks_in_biome.get('day', [])
+                    night_tracks_per_biome = tracks_in_biome.get('night', [])
+                    total_tracks = len(day_tracks_per_biome) + len(night_tracks_per_biome)
+                    day_tracks = day_tracks_per_biome
+                    night_tracks = night_tracks_per_biome
+                
+                # If no per-biome tracks, check global day_tracks/night_tracks (for backwards compatibility)
+                if total_tracks == 0 and hasattr(self, 'day_tracks') and hasattr(self, 'night_tracks'):
+                    day_tracks = self.day_tracks if self.day_tracks else []
+                    night_tracks = self.night_tracks if self.night_tracks else []
+                    total_tracks = len(day_tracks) + len(night_tracks)
+                
+                # If this biome has tracks, warn the user
+                if total_tracks > 0:
+                    # Create warning dialog with track list
+                    warning_dlg = QDialog(dlg)
+                    warning_dlg.setWindowFlags(warning_dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+                    warning_dlg.setWindowTitle('⚠️ Tracks Will Be Removed')
+                    warning_dlg.setMinimumSize(500, 350)
+                    warn_layout = QVBoxLayout(warning_dlg)
+                    
+                    # Warning message
+                    warn_text = QLabel(
+                        f'<b>⚠️ Warning!</b><br><br>'
+                        f'The biome <b>{biome_data[0]}: {biome_data[1]}</b> has <b>{total_tracks} track(s)</b> already assigned.<br><br>'
+                        f'<b>If you uncheck this biome, all {total_tracks} track(s) will be PERMANENTLY DELETED.</b><br><br>'
+                        f'<i>Tracks to be removed:</i>'
+                    )
+                    warn_text.setWordWrap(True)
+                    warn_layout.addWidget(warn_text)
+                    
+                    # Scrollable track list (similar to View All Tracks)
+                    tracks_display = QTextEdit()
+                    tracks_display.setReadOnly(True)
+                    tracks_display.setStyleSheet('background-color: #181c2a; color: #e6ecff; font-size: 11px; border-radius: 4px;')
+                    
+                    track_list_html = '<b>Day Tracks:</b><br>'
+                    if day_tracks:
+                        for track in day_tracks:
+                            track_name = Path(track).name
+                            track_list_html += f'  • {track_name}<br>'
+                    else:
+                        track_list_html += '  (none)<br>'
+                    
+                    track_list_html += '<br><b>Night Tracks:</b><br>'
+                    if night_tracks:
+                        for track in night_tracks:
+                            track_name = Path(track).name
+                            track_list_html += f'  • {track_name}<br>'
+                    else:
+                        track_list_html += '  (none)<br>'
+                    
+                    tracks_display.setHtml(track_list_html)
+                    warn_layout.addWidget(tracks_display, 1)
+                    
+                    # Buttons
+                    button_layout = QHBoxLayout()
+                    cancel_btn = QPushButton('Cancel - Keep Biome')
+                    cancel_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; padding: 8px;')
+                    delete_btn = QPushButton('❌ Delete Tracks && Uncheck')
+                    delete_btn.setStyleSheet('background-color: #c41e3a; color: #e6ecff; padding: 8px;')
+                    
+                    button_layout.addWidget(cancel_btn)
+                    button_layout.addStretch()
+                    button_layout.addWidget(delete_btn)
+                    warn_layout.addLayout(button_layout)
+                    
+                    # Result variable
+                    result = {'delete': False}
+                    
+                    def on_cancel():
+                        result['delete'] = False
+                        warning_dlg.accept()
+                    
+                    def on_delete():
+                        result['delete'] = True
+                        warning_dlg.accept()
+                    
+                    cancel_btn.clicked.connect(on_cancel)
+                    delete_btn.clicked.connect(on_delete)
+                    
+                    warning_dlg.exec_()
+                    
+                    # If user clicked Cancel, re-check the item
+                    if not result['delete']:
+                        tree_widget.blockSignals(True)  # Prevent infinite recursion
+                        item.setCheckState(0, Qt.Checked)
+                        update_item_background(item)
+                        tree_widget.blockSignals(False)
+                        return
+                    else:
+                        # User confirmed deletion - remove per-biome tracks if they exist
+                        if biome_data in self.add_selections:
+                            del self.add_selections[biome_data]
+                            logger.log(f'Deleted {total_tracks} tracks from {biome_data[0]}:{biome_data[1]}', context='BiomeDialog')
+                        else:
+                            logger.log(f'Unchecked {biome_data[0]}:{biome_data[1]} - removed from biome selection', context='BiomeDialog')
+                        
+                        # Also remove from selected_biomes to prevent restoration on dialog reopen
+                        if biome_data in self.selected_biomes:
+                            self.selected_biomes.remove(biome_data)
+            
+            # Update styling
+            update_item_background(item)
+        
+        # Apply initial styling to all biome items
+        for i in range(tree_widget.topLevelItemCount()):
+            item = tree_widget.topLevelItem(i)
+            update_item_background(item)
+        
+        # Connect to itemChanged to update styling when checkbox is toggled
+        tree_widget.itemChanged.connect(on_item_changed)
         
         layout.addWidget(tree_widget)
         
@@ -2632,23 +3123,252 @@ QGroupBox {{
         confirm_label.setStyleSheet('color: #e6ecff; font-size: 13px; margin-top: 8px;')
         layout.addWidget(confirm_label)
 
-        # Restore previous selection
-        if self.selected_biomes:
+        # Restore previous selection from two sources:
+        # 1. selected_biomes list (primary)
+        # 2. add_selections keys (if biomes have tracks but selected_biomes is empty)
+        
+        biomes_to_check = set(self.selected_biomes) if self.selected_biomes else set()
+        
+        # If no biomes in selected_biomes but we have add_selections with tracks, use those
+        if not biomes_to_check and hasattr(self, 'add_selections') and self.add_selections:
+            biomes_to_check = set(self.add_selections.keys())
+            logger.log(f'Syncing: Found {len(biomes_to_check)} biomes in add_selections, checking them', context='BiomeDialog')
+        
+        # Check the biomes
+        if biomes_to_check:
             for i in range(tree_widget.topLevelItemCount()):
                 item = tree_widget.topLevelItem(i)
-                if item.data(0, Qt.UserRole) in self.selected_biomes:
-                    item.setSelected(True)
+                if item.data(0, Qt.UserRole) in biomes_to_check:
+                    item.setCheckState(0, Qt.Checked)
 
+        # 🆕 BOTH MODE: Different button label to indicate it stays open
         ok_btn = QPushButton('OK')
-        layout.addWidget(ok_btn)
+        ok_btn.setToolTip('Confirm biome selection')
+        
+        # Create button row with Help, Screenshot, and OK
+        button_row = QHBoxLayout()
+        
+        # Help button (lifeboat icon)
+        help_btn = QPushButton('🛟')
+        help_btn.setToolTip('Biome selection help')
+        help_btn.setMaximumWidth(50)
+        def show_help():
+            help_dlg = QDialog(dlg)
+            help_dlg.setWindowFlags(help_dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+            help_dlg.setWindowTitle('Biome Selection Help')
+            help_dlg.setMinimumSize(450, 300)
+            help_layout = QVBoxLayout(help_dlg)
+            help_text = QLabel(
+                '<b>How to Select Biomes</b><br><br>'
+                '✓ <b>Check the box</b> next to any biome you want to modify<br><br>'
+                '<b>Mode-Specific Info:</b><br>'
+                '• <b>Add Mode:</b> Your music plays alongside original tracks<br>'
+                '• <b>Replace Mode:</b> Your music replaces original tracks<br>'
+                '• <b>Both Mode:</b> Replace some, add others (select biomes for new tracks)<br><br>'
+                '<b>Tips:</b><br>'
+                '• Use surface_ prefix for surface biomes<br>'
+                '• Use underground_ prefix for cave biomes<br>'
+                '• Hover over biomes to see vanilla track counts<br>'
+                '• Multi-select by checking multiple boxes<br><br>'
+                '⚠️ <b>Important:</b> Selected biomes only affect your current mod. '
+                'Create a new mod to customize different biomes.'
+            )
+            help_text.setWordWrap(True)
+            help_layout.addWidget(help_text)
+            close_btn = QPushButton('Close')
+            close_btn.clicked.connect(help_dlg.accept)
+            help_layout.addWidget(close_btn)
+            help_dlg.exec_()
+        help_btn.clicked.connect(show_help)
+        button_row.addWidget(help_btn)
+        
+        # Screenshot button (icon only)
+        screenshot_btn = QPushButton('📸')
+        screenshot_btn.setToolTip('Take a screenshot of this dialog')
+        screenshot_btn.setMaximumWidth(50)
+        def take_screenshot_dialog():
+            try:
+                success, msg = take_screenshot(dlg)
+                if success:
+                    QMessageBox.information(dlg, 'Screenshot Saved', msg)
+                else:
+                    QMessageBox.warning(dlg, 'Screenshot Failed', msg)
+            except Exception as e:
+                QMessageBox.warning(dlg, 'Screenshot Failed', f'Could not save screenshot: {e}')
+        screenshot_btn.clicked.connect(take_screenshot_dialog)
+        button_row.addWidget(screenshot_btn)
+        
+        # Select All button
+        select_all_btn = QPushButton('Select All')
+        select_all_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; padding: 6px;')
+        select_all_btn.setToolTip('Check all biomes')
+        def select_all():
+            tree_widget.blockSignals(True)
+            for i in range(tree_widget.topLevelItemCount()):
+                item = tree_widget.topLevelItem(i)
+                item.setCheckState(0, Qt.Checked)
+            tree_widget.blockSignals(False)
+            # Manually trigger update_confirmation to refresh label
+            update_confirmation()
+        select_all_btn.clicked.connect(select_all)
+        button_row.addWidget(select_all_btn)
+        
+        # Deselect All button
+        deselect_all_btn = QPushButton('Deselect All')
+        deselect_all_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; padding: 6px;')
+        deselect_all_btn.setToolTip('Uncheck all biomes and delete their tracks')
+        def deselect_all():
+            """Deselect all biomes and warn user about track deletion"""
+            # Collect all biomes with tracks
+            biomes_with_tracks = {}
+            total_tracks = 0
+            
+            # Check each biome for tracks in add_selections
+            for i in range(tree_widget.topLevelItemCount()):
+                item = tree_widget.topLevelItem(i)
+                biome_data = item.data(0, Qt.UserRole)
+                if not biome_data:
+                    continue
+                
+                day_tracks_list = []
+                night_tracks_list = []
+                
+                # Check per-biome selections
+                if hasattr(self, 'add_selections') and biome_data in self.add_selections:
+                    tracks_in_biome = self.add_selections[biome_data]
+                    day_tracks_list = tracks_in_biome.get('day', [])
+                    night_tracks_list = tracks_in_biome.get('night', [])
+                
+                # If this biome has tracks, add to warning list
+                track_count = len(day_tracks_list) + len(night_tracks_list)
+                if track_count > 0:
+                    biomes_with_tracks[biome_data] = {
+                        'day': day_tracks_list,
+                        'night': night_tracks_list,
+                        'count': track_count
+                    }
+                    total_tracks += track_count
+            
+            # If no tracks exist, just deselect all without warning
+            if not biomes_with_tracks:
+                tree_widget.blockSignals(True)
+                for i in range(tree_widget.topLevelItemCount()):
+                    item = tree_widget.topLevelItem(i)
+                    item.setCheckState(0, Qt.Unchecked)
+                tree_widget.blockSignals(False)
+                update_confirmation()
+                return
+            
+            # Show warning dialog with all biomes and tracks
+            warning_dlg = QDialog(dlg)
+            warning_dlg.setWindowFlags(warning_dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+            warning_dlg.setWindowTitle('⚠️ Delete All Tracks?')
+            warning_dlg.setMinimumSize(550, 400)
+            warn_layout = QVBoxLayout(warning_dlg)
+            
+            # Warning message
+            warn_text = QLabel(
+                f'<b>⚠️ Warning!</b><br><br>'
+                f'You are about to <b>PERMANENTLY DELETE ALL tracks</b> from <b>{len(biomes_with_tracks)} biome(s)</b>.<br><br>'
+                f'<b>Total tracks to be deleted: {total_tracks}</b><br><br>'
+                f'<i>Biomes and their tracks:</i>'
+            )
+            warn_text.setWordWrap(True)
+            warn_layout.addWidget(warn_text)
+            
+            # Scrollable list of biomes with track counts
+            biomes_display = QTextEdit()
+            biomes_display.setReadOnly(True)
+            biomes_display.setStyleSheet('background-color: #181c2a; color: #e6ecff; font-size: 11px; border-radius: 4px;')
+            
+            biome_list_html = ''
+            for (cat, bio), track_data in sorted(biomes_with_tracks.items()):
+                day_count = len(track_data['day'])
+                night_count = len(track_data['night'])
+                biome_list_html += f'<b>{cat}: {bio}</b> ({track_data["count"]} tracks)<br>'
+                
+                if track_data['day']:
+                    biome_list_html += f'  <i>Day ({day_count}):</i><br>'
+                    for track in track_data['day']:
+                        track_name = Path(track).name
+                        biome_list_html += f'    • {track_name}<br>'
+                
+                if track_data['night']:
+                    biome_list_html += f'  <i>Night ({night_count}):</i><br>'
+                    for track in track_data['night']:
+                        track_name = Path(track).name
+                        biome_list_html += f'    • {track_name}<br>'
+                
+                biome_list_html += '<br>'
+            
+            biomes_display.setHtml(biome_list_html)
+            warn_layout.addWidget(biomes_display, 1)
+            
+            # Buttons
+            button_layout = QHBoxLayout()
+            cancel_btn = QPushButton('Cancel - Keep Biomes')
+            cancel_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; padding: 8px;')
+            delete_btn = QPushButton('❌ Delete All Tracks && Deselect')
+            delete_btn.setStyleSheet('background-color: #c41e3a; color: #e6ecff; padding: 8px;')
+            
+            button_layout.addWidget(cancel_btn)
+            button_layout.addStretch()
+            button_layout.addWidget(delete_btn)
+            warn_layout.addLayout(button_layout)
+            
+            # Result variable
+            result = {'delete': False}
+            
+            def on_cancel():
+                result['delete'] = False
+                warning_dlg.accept()
+            
+            def on_delete():
+                result['delete'] = True
+                warning_dlg.accept()
+            
+            cancel_btn.clicked.connect(on_cancel)
+            delete_btn.clicked.connect(on_delete)
+            
+            warning_dlg.exec_()
+            
+            # If user cancelled, do nothing
+            if not result['delete']:
+                return
+            
+            # User confirmed - delete all tracks from all biomes and deselect
+            for biome_data in biomes_with_tracks.keys():
+                # Delete per-biome tracks
+                if biome_data in self.add_selections:
+                    del self.add_selections[biome_data]
+                    logger.log(f'Deleted {biomes_with_tracks[biome_data]["count"]} tracks from {biome_data[0]}:{biome_data[1]}', context='BiomeDialog')
+                
+                # Remove from selected_biomes
+                if biome_data in self.selected_biomes:
+                    self.selected_biomes.remove(biome_data)
+            
+            # Now deselect all biomes in the tree
+            tree_widget.blockSignals(True)
+            for i in range(tree_widget.topLevelItemCount()):
+                item = tree_widget.topLevelItem(i)
+                item.setCheckState(0, Qt.Unchecked)
+            tree_widget.blockSignals(False)
+            update_confirmation()
+        
+        deselect_all_btn.clicked.connect(deselect_all)
+        button_row.addWidget(deselect_all_btn)
+        
+        button_row.addStretch()
+        button_row.addWidget(ok_btn)
+        layout.addLayout(button_row)
         dlg.setLayout(layout)
 
         def update_confirmation():
-            # Only get top-level selected items (biomes), not child track items
+            # Get checked biome items (only top-level items)
             selected = []
             for i in range(tree_widget.topLevelItemCount()):
                 item = tree_widget.topLevelItem(i)
-                if item.isSelected():
+                if item.checkState(0) == Qt.Checked:
                     biome_data = item.data(0, Qt.UserRole)
                     if biome_data:
                         selected.append(biome_data)
@@ -2663,11 +3383,11 @@ QGroupBox {{
 
         def on_ok():
             update_confirmation()
-            # Only get top-level selected items (biomes), not child track items
+            # Get checked biome items (only top-level items, not child track items)
             selected = []
             for i in range(tree_widget.topLevelItemCount()):
                 item = tree_widget.topLevelItem(i)
-                if item.isSelected():
+                if item.checkState(0) == Qt.Checked:
                     biome_data = item.data(0, Qt.UserRole)
                     if biome_data:
                         selected.append(biome_data)
@@ -2726,18 +3446,22 @@ QGroupBox {{
                 self.audio_status_label.setText(f'✅ Biomes selected: {", ".join([f"{cat}:{bio}" for cat, bio in selected])}')
                 # Update Step 6 biome label if it exists
                 if hasattr(self, 'selected_biomes_label'):
-                    self.selected_biomes_label.setText(f'🌍 Biomes: {", ".join([bio for cat, bio in selected])}')
+                    # Format: ✓ Biomes (88): biome1, biome2, biome3, biome4, biome5, and 83 more
+                    biome_names = [bio for cat, bio in selected]
+                    biome_count = len(biome_names)
+                    if biome_count <= 5:
+                        biome_display = ", ".join(biome_names)
+                    else:
+                        first_five = ", ".join(biome_names[:5])
+                        remaining = biome_count - 5
+                        biome_display = f'{first_five}, and {remaining} more'
+                    self.selected_biomes_label.setText(f'✓ Biomes ({biome_count}): {biome_display}')
             else:
                 self.audio_status_label.setText('No biomes selected.')
                 if hasattr(self, 'selected_biomes_label'):
                     self.selected_biomes_label.setText('No biomes selected yet.')
             
             dlg.accept()
-            
-            # CHAIN: If called from Both mode biome selection, continue to next step
-            if caller == 'both_mode_biome':
-                print(f'[BOTH_CHAIN] Biome dialog accepted, moving to Step 3')
-                self._on_both_mode_chain_step3_step6()
         ok_btn.clicked.connect(on_ok)
         dlg.exec_()
 
@@ -2750,24 +3474,28 @@ QGroupBox {{
                 '⚠️ Remove All Vanilla Tracks?',
                 (
                     'Are you SURE? This will:\n\n'
-                    'REMOVE (replace through Remove operation) all vanilla Starbound tracks from selected biome(s)\n'
-                    'Only YOUR custom music will ever play in these biomes after they are created and mod is enabled\n'
-                    'Original biome music will NOT play again, ever (even if mod is disabled)\n'
-                    'This change applies ONLY to selected biome(s)\n\n'
-                    'If mod is disabled or removed, affected biomes running on the mod will go \'silent\' as vanilla tracks will never play even as a fallback option\n'
-                    '\n'
+                    'CLEAR all vanilla Starbound tracks from selected biome(s)\n'
+                    '• Replaces vanilla track arrays with empty arrays\n'
+                    '• Adds only YOUR custom music to the biome\n'
+                    '• Only YOUR music will play in these biomes (100% guaranteed)\n'
+                    '• This change applies ONLY to selected biome(s)\n\n'
+                    'CONFLICT WARNING ⚠️ MOD COMPATIBILITY:\n'
+                    '• Remove Mode uses REPLACE operations (like Replace Mode)\n'
+                    '• WILL conflict with other REPLACE-based music mods\n'
+                    '• ADD-based mods are fine (no conflict)\n'
+                    '• If conflict occurs: only one mod\'s music will play\n'
+                    '• Solution: Disable one mod, or adjust mod load order\n\n'
+                    'CONSEQUENCE if mod is later disabled/removed:\n'
+                    '• Affected biomes will never play original music again unless mod is reinstalled\n'
                     'RECOMMENDATION:\n'
-                    'Use only for complete thematic overhauls or multi-part tracks\n'
-                    'Ideal when you want FULL control of biome music and only want to hear YOUR tracks\n\n'
-                    'This will make your mod replace entire biome music and is IRREVERSIBLE through normal means.\n'
+                    '• Ideal when you want FULL control and ONLY your music to play\n'
+                    '• Perfect for complete thematic replacements or multi-part tracks\n'
+                    '• Keep backup of mod for easy recovery\n'
+                    '• Check if other music mods use ADD mode (safe together)\n\n'
+                    'This is the SAFEST option for most players (simplest && fastest).\n'
+                    'Once a world/save is loaded with this mode enabled, that world/save will only play your custom music.\n'
                     '\n'
-                    'SAFE RECOVERY OPTIONS:\n'
-                    'Restore removed mod\n'
-                    'Use in-game tool Terraformer to restore vanilla music to affected biomes.\n'
-                    '\n'
-                    '⚠️ !ONLY USE THIS IF YOU UNDERSTAND THE RISKS! ⚠️\n\n'
-                    '\n'
-                    'Proceed?'
+                    'Continue with Remove Mode?'
                 ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
@@ -3126,6 +3854,140 @@ QGroupBox {{
         else:
             self.logger.log('User cancelled mod folder browse dialog')
 
+    def _refresh_selected_files_display(self):
+        """Refresh the selected files display label to show current selected_audio_files list."""
+        if hasattr(self, 'selected_audio_files') and self.selected_audio_files:
+            filenames = [os.path.basename(f) for f in self.selected_audio_files]
+            bullet_lines = ['<span style="font-size:13px">Selected:</span>']
+            
+            self.files_needing_split.clear()
+            self.split_decisions.clear()
+            
+            from utils.audio_utils import get_audio_duration
+            for file_path, basename in zip(self.selected_audio_files, filenames):
+                duration_minutes = get_audio_duration(file_path)
+                
+                if duration_minutes and duration_minutes > 30:
+                    self.files_needing_split[file_path] = duration_minutes
+                    display_label = f'&bull; {basename} <span style="color: #ffcc00;">⚠️ {duration_minutes:.1f} min</span>'
+                else:
+                    display_label = f'&bull; {basename}'
+                
+                bullet_lines.append(display_label)
+            
+            self.selected_files_label.setText('<br>'.join(bullet_lines))
+        else:
+            self.selected_files_label.setText('')
+
+    def _check_for_duplicate_tracks(self, files: list, mod_music_path: Path) -> list:
+        """
+        Check if any selected files would create duplicate OGG files in the mod folder.
+        Shows dialog if duplicates found, returns files user selected to process.
+        
+        Args:
+            files: List of file paths to check
+            mod_music_path: Path to mod's music folder
+            
+        Returns:
+            List of files to process (may be subset if user chose Skip)
+        """
+        if not mod_music_path.exists():
+            return files  # No duplicates possible if folder doesn't exist yet
+        
+        from utils.audio_utils import sanitize_filename
+        import os
+        
+        duplicates = []
+        new_files = []
+        
+        for file_path in files:
+            # Match the exact logic from atomicwriter.py:
+            # 1. Remove extension first (os.path.splitext)
+            # 2. Sanitize the base name
+            # 3. Add .ogg extension
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            sanitized_base = sanitize_filename(base_name)
+            ogg_filename = f"{sanitized_base}.ogg"
+            ogg_path = mod_music_path / ogg_filename
+            
+            # Check for main file OR any split parts (_part1, _part2, etc.)
+            is_duplicate = False
+            if ogg_path.exists():
+                is_duplicate = True
+            else:
+                # Check for split files: base_part1.ogg, base_part2.ogg, etc.
+                part_num = 1
+                while True:
+                    part_path = mod_music_path / f"{sanitized_base}_part{part_num}.ogg"
+                    if part_path.exists():
+                        is_duplicate = True
+                        break
+                    part_num += 1
+                    if part_num > 20:  # Safety limit - don't check more than 20 parts
+                        break
+            
+            if is_duplicate:
+                duplicates.append({
+                    'original': os.path.basename(file_path),
+                    'converted': ogg_filename,
+                    'full_path': file_path
+                })
+            else:
+                new_files.append(file_path)
+        
+        if not duplicates:
+            return files  # No duplicates found
+        
+        # Show dialog with duplicate conflicts
+        dup_message = (
+            f'⚠️ These {len(duplicates)} file(s) already exist in your mod:\n\n'
+        )
+        
+        for i, dup in enumerate(duplicates[:5], 1):  # Show first 5
+            dup_message += f'{i}. {dup["converted"]}\n'
+        
+        if len(duplicates) > 5:
+            dup_message += f'\n... and {len(duplicates) - 5} more'
+        
+        # Create message box with custom button labels
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setWindowTitle('🔄 Duplicate OGG Files Detected')
+        msg_box.setText(dup_message)
+        
+        skip_btn = msg_box.addButton('Skip', QMessageBox.NoRole)
+        overwrite_btn = msg_box.addButton('Overwrite', QMessageBox.AcceptRole)
+        cancel_btn = msg_box.addButton('Cancel', QMessageBox.RejectRole)
+        msg_box.setDefaultButton(cancel_btn)
+        
+        msg_box.exec()
+        
+        if msg_box.clickedButton() == skip_btn:
+            # Skip - remove duplicates from selected list, keep new files to add
+            duplicate_paths = [d['full_path'] for d in duplicates]
+            duplicate_basenames = [os.path.basename(d['full_path']).lower() for d in duplicates]
+            
+            if hasattr(self, 'selected_audio_files'):
+                # Remove by both full path AND basename (handles path format differences)
+                self.selected_audio_files = [
+                    f for f in self.selected_audio_files 
+                    if f not in duplicate_paths and os.path.basename(f).lower() not in duplicate_basenames
+                ]
+                # Refresh UI immediately to show removed duplicates
+                self._refresh_selected_files_display()
+            
+            self.logger.log(f'[DUPLICATES] Skipped {len(duplicates)} duplicate files. Keeping {len(new_files)} new file(s).')
+            return new_files  # Add only the new files, not the duplicates
+        
+        elif msg_box.clickedButton() == overwrite_btn:
+            # Overwrite - keep all files for conversion (duplicates + new)
+            self.logger.log(f'[DUPLICATES] User will overwrite {len(duplicates)} existing OGG files')
+            return files  # Add all files (duplicates will overwrite, new will be added)
+        
+        else:  # Cancel
+            self.logger.log(f'[DUPLICATES] User cancelled file selection ({len(duplicates)} duplicates found)')
+            return []  # Cancel - don't add any files
+
     def browse_audio(self):
         # Log audio file browse action
         # Use HOME directory as default, or last used directory if available
@@ -3245,7 +4107,43 @@ QGroupBox {{
             if not non_ogg_files:
                 return  # No valid files selected
             
-            # CUMULATIVE SELECTION: Add new files to existing selection (avoid duplicates)
+            # CHECK FOR DUPLICATE OGG FILES in mod folder
+            mod_name = self.modname_input.text().strip()
+            if mod_name:
+                from pathlib import Path
+                starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
+                staging_dir = starsound_dir / 'staging'
+                safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+                mod_music_path = staging_dir / safe_mod_name / 'music'
+                
+                # Check for duplicates and filter based on user choice
+                if mod_music_path.exists():
+                    self.logger.log(f'[DUPLICATES] Checking {len(non_ogg_files)} file(s) for duplicates in {mod_music_path}')
+                    non_ogg_files = self._check_for_duplicate_tracks(non_ogg_files, mod_music_path)
+                else:
+                    self.logger.log(f'[DUPLICATES] Mod music folder does not exist yet ({mod_music_path}) - no duplicates possible')
+                
+                if not non_ogg_files:
+                    self.logger.log('[SELECT_AUDIO] No files to add after duplicate check')
+                    # Update UI display even if no new files added
+                    if hasattr(self, 'selected_audio_files') and self.selected_audio_files:
+                        filenames = [os.path.basename(f) for f in self.selected_audio_files]
+                        bullet_lines = ['<span style="font-size:13px">Selected:</span>']
+                        from utils.audio_utils import get_audio_duration
+                        for file_path, basename in zip(self.selected_audio_files, filenames):
+                            duration_minutes = get_audio_duration(file_path)
+                            if duration_minutes and duration_minutes > 30:
+                                self.files_needing_split[file_path] = duration_minutes
+                                display_label = f'&bull; {basename} <span style="color: #ffcc00;">⚠️ {duration_minutes:.1f} min</span>'
+                            else:
+                                display_label = f'&bull; {basename}'
+                            bullet_lines.append(display_label)
+                        self.selected_files_label.setText('<br>'.join(bullet_lines))
+                    else:
+                        self.selected_files_label.setText('')
+                    return
+            
+            # CUMULATIVE SELECTION: Add new files to existing selection (avoid duplicates with previously selected files)
             if not hasattr(self, 'selected_audio_files'):
                 self.selected_audio_files = []
             
@@ -3295,7 +4193,8 @@ QGroupBox {{
                 starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
                 staging_dir = starsound_dir / 'staging'
                 safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                originals_folder = staging_dir / safe_mod_name / 'backups' / 'originals'
+                backup_root = self._get_backup_path(safe_mod_name)
+                originals_folder = backup_root / 'originals'
                 originals_folder.mkdir(parents=True, exist_ok=True)
                 for f in self.selected_audio_files:
                     try:
@@ -3393,8 +4292,8 @@ QGroupBox {{
             # No files need splitting
             return True
         
-        from split_confirmation_dialog import SplitConfirmationDialog
-        from denial_confirmation_dialog import DenialConfirmationDialog
+        from dialogs.split_confirmation_dialog import SplitConfirmationDialog
+        from dialogs.denial_confirmation_dialog import DenialConfirmationDialog
         import os
         
         # Collect ALL files that need splitting
@@ -3455,106 +4354,73 @@ QGroupBox {{
                 - int: Single segment length in minutes (applied to all files)
                 - dict: Per-file segment lengths {file_path: segment_length_minutes}
         
-        Modifies self.selected_audio_files to replace split files with their segments.
-        Populates self.segment_origins for per-track config grouping.
-        Shows preview of splits created before proceeding.
-        
         Returns:
             bool: True if all splits successful or no splits needed,
                   False if any split failed
-        """
-        from utils.audio_utils import split_audio_file, get_audio_duration
-        from split_preview_dialog import SplitPreviewDialog
-        from split_progress_dialog import SplitProgressDialog
-        import os
         
+        NOTE: Creates and manages dialogs on GUI thread only. Uses worker thread
+        for actual FFmpeg processing to prevent UI freeze.
+        """
         if not self.split_decisions:
             # No splitting needed
             return True
         
-        # Convert single int to dict format for consistency
+        # Prepare file list and segment lengths (stored on main window for worker to access)
         if isinstance(segment_length, int):
-            per_file_segment_lengths = {file_path: segment_length for file_path in self.split_decisions.keys()}
+            self.per_file_segment_lengths = {
+                file_path: segment_length 
+                for file_path in self.split_decisions.keys()
+            }
         else:
-            per_file_segment_lengths = segment_length
+            self.per_file_segment_lengths = segment_length
         
-        # Initialize segment origin tracking (maps segment_path -> original_file_path)
-        if not hasattr(self, 'segment_origins'):
-            self.segment_origins = {}
-        
-        # Track which files were successfully split
-        files_to_remove = []  # Original files to remove from selected list
-        files_to_add = []      # Split segments to add
-        split_metadata = {}    # Track original file info for preview
-        
-        # Count files that need splitting
+        # Track files to split
         files_to_split = [fp for fp, d in self.split_decisions.items() if d == "ACCEPT"]
-        total_files = len(files_to_split)
+        if not files_to_split:
+            return True
         
-        # Show progress dialog (as independent top-level modal window)
-        progress_dialog = SplitProgressDialog(self)
-        progress_dialog.setWindowModality(Qt.ApplicationModal)
-        progress_dialog.start_animation()
-        progress_dialog.show()
+        # CREATE PROGRESS DIALOG ON GUI THREAD (not worker thread)
+        self.progress_dialog = SplitProgressDialog(self)
+        self.progress_dialog.setWindowModality(Qt.ApplicationModal)
+        self.progress_dialog.start_animation()
+        self.progress_dialog.show()
         
-        file_count = 0
-        for file_path, decision in self.split_decisions.items():
-            if decision != "ACCEPT":
-                # User denied splitting for this file, keep as-is
-                continue
-            
-            filename = os.path.basename(file_path)
-            file_count += 1
-            # Get this file's specific segment length (defaults to 25 if not found)
-            segment_length_minutes = per_file_segment_lengths.get(file_path, 25)
-            self.logger.log(f'Starting FFmpeg split operation for: {filename} ({segment_length_minutes} min segments)')
-            self.audio_status_label.setText(f'Splitting: {filename}...')
-            # Update progress dialog
-            progress_dialog.update_current_file(filename, file_count, total_files)
-            
-            # Perform the split with per-file segment length
-            result = split_audio_file(file_path, segment_length_minutes=segment_length_minutes, logger=self.logger)
-            
-            if result['success']:
-                self.logger.log(f'Split successful: {result["segment_count"]} segments created')
-                files_to_remove.append(file_path)
-                files_to_add.extend(result['split_files'])
-                
-                # SEGMENT TRACKING: Map each segment back to its original file
-                for segment_path in result['split_files']:
-                    self.segment_origins[segment_path] = file_path
-                    segment_name = os.path.basename(segment_path)
-                    self.logger.log(f'[SEGMENT_TRACK] {segment_name} origin: {filename}')
-                
-                # Store metadata for preview
-                original_duration = get_audio_duration(file_path)
-                split_metadata[filename] = {
-                    'original_duration': original_duration,
-                    'segments': result['split_files'],
-                    'segment_durations': result['segment_durations']
-                }
-                
-                # Update status
-                self.audio_status_label.setText(
-                    f'✓ {filename} split into {result["segment_count"]} segments'
-                )
-            else:
-                # Split failed
-                progress_dialog.stop_animation()
-                progress_dialog.close()
-                self.logger.error(f'Split failed for {filename}: {result["message"]}')
-                QMessageBox.critical(
-                    self,
-                    'Split Failed',
-                    f'Could not split {filename}:\n\n{result["message"]}'
-                )
-                return False
+        # CREATE AND START WORKER THREAD
+        self.split_worker = SplitAudioWorker(self, segment_length, files_to_split)
+        self.split_worker.progress_update.connect(self._on_split_progress_update)
+        self.split_worker.finished.connect(self._on_split_finished)
+        self.split_worker.error.connect(self._on_split_error)
+        self.split_worker.start()
         
-        # Close progress dialog - splitting complete
-        progress_dialog.stop_animation()
-        progress_dialog.close()
+        return True
+    
+    def _on_split_progress_update(self, filename: str, current_num: int, total_num: int):
+        """Update progress dialog from worker thread signal."""
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.update_current_file(filename, current_num, total_num)
+        self.audio_status_label.setText(f'Splitting: {filename}...')
+    
+    def _on_split_finished(self, results: dict):
+        """Worker thread finished successfully. Update UI and continue conversion if needed."""
+        # Close progress dialog
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.stop_animation()
+            self.progress_dialog.close()
         
-        # Update selected files list: remove originals, add segments
+        # Extract results from worker
+        files_to_remove = results.get('files_to_remove', [])
+        files_to_add = results.get('files_to_add', [])
+        split_metadata = results.get('split_metadata', {})
+        success = results.get('success', False)
+        
+        if not success:
+            error_msg = results.get('error', 'Unknown split error')
+            QMessageBox.critical(self, 'Split Failed', f'Could not split audio:\n\n{error_msg}')
+            self.logger.error(f'File splitting failed: {error_msg}')
+            self.converter_state = None
+            return
+        
+        # Update selected files list
         for original in files_to_remove:
             if original in self.selected_audio_files:
                 self.selected_audio_files.remove(original)
@@ -3567,48 +4433,248 @@ QGroupBox {{
             
             # Show preview dialog if any splits were created
             if split_metadata:
-                # Show preview for ALL split files (not just the first)
-                preview_dialog = SplitPreviewDialog(
-                    parent=self,
-                    split_metadata=split_metadata
-                )
-                preview_dialog.exec_()
-                choice = preview_dialog.get_choice()
-                
-                if choice != "PROCEED":
-                    self.logger.log('User cancelled after split preview - cleaning up temporary WAV segments')
-                    # Cleanup WAV files since conversion won't happen
-                    import os
-                    import shutil
-                    temp_dirs_to_remove = set()
-                    
-                    for wav_file in files_to_add:
-                        if wav_file.endswith('.wav') and os.path.isfile(wav_file):
-                            try:
-                                # Track temp directory for cleanup
-                                wav_dir = os.path.dirname(wav_file)
-                                temp_dir = os.path.join(wav_dir, '.starsound_splits_temp')
-                                if os.path.isdir(temp_dir):
-                                    temp_dirs_to_remove.add(temp_dir)
-                                
-                                # Remove the WAV file
-                                os.remove(wav_file)
-                                self.logger.log(f'[CLEANUP] Removed cancelled segment: {os.path.basename(wav_file)}')
-                            except Exception as e:
-                                self.logger.warn(f'[CLEANUP] Could not remove WAV file {os.path.basename(wav_file)}: {e}')
-                    
-                    # Cleanup temp directories
-                    for temp_dir in temp_dirs_to_remove:
-                        try:
-                            if os.path.isdir(temp_dir):
-                                shutil.rmtree(temp_dir)
-                                self.logger.log(f'[CLEANUP] Removed temp directory: {os.path.basename(temp_dir)}')
-                        except Exception as e:
-                            self.logger.warn(f'[CLEANUP] Could not remove temp directory {temp_dir}: {e}')
-                    
-                    return False
+                self._show_split_preview(split_metadata, files_to_add)
         
-        return True
+        # === CONTINUE CONVERTER WORKFLOW IF PENDING ===
+        # If convert_audio() started a split, continue with per-track config now that split is complete
+        if hasattr(self, 'converter_state') and self.converter_state:
+            self.logger.log('[CONVERT_FLOW] Split complete! Continuing with per-track configuration...')
+            self._continue_converter_after_split()
+            self.converter_state = None
+    
+    def _continue_converter_after_split(self):
+        """Continue audio conversion after splitting completes (called from _on_split_finished)."""
+        if not hasattr(self, 'converter_state') or not self.converter_state:
+            return
+        
+        state = self.converter_state
+        files = state['files']
+        mod_name = state['mod_name']
+        bitrate_value = state['bitrate_value']
+        
+        self.logger.log(f'[CONVERT_FLOW] Continuing: Per-track config for {len(files)} file(s)')
+        
+        # Show per-track audio config for segments grouped by original file
+        # Use sensible defaults matching audio_processing_dialog (trim/silence_trim will be auto-disabled for split audio)
+        audio_processing_options = {
+            'trim': True,
+            'silence_trim': True,
+            'sonic_scrubber': True,
+            'compression': True,
+            'compression_preset': 'Moderate (balanced)',
+            'soft_clip': True,
+            'eq': True,
+            'eq_preset': 'Warm (bass-heavy)',
+            'normalize': True,
+            'fade': True,  # CRITICAL: Must be enabled for proper audio processing
+            'fade_in_duration': '0hr0m0.5s',
+            'fade_out_duration': '0hr0m5s',
+            'de_esser': False,
+            'stereo_to_mono': False,
+        }
+        
+        segment_origins = getattr(self, 'segment_origins', {})
+        if segment_origins:
+            self.logger.log(f'[CONVERT_FLOW] Segment grouping enabled: {len(segment_origins)} segment(s)')
+        
+        per_track_dialog = PerTrackAudioConfigDialog(
+            files, audio_processing_options, self, segment_origins=segment_origins
+        )
+        per_track_result = per_track_dialog.exec_()
+        if per_track_result == 0:
+            self.logger.log('[CONVERT_FLOW] User cancelled per-track config - aborting conversion')
+            return
+        
+        per_track_settings = per_track_dialog.get_per_track_settings()
+        self.logger.log(f'[CONVERT_FLOW] Per-track settings received for {len(per_track_settings)} files')
+        
+        # Extract bitrate from per-track dialog
+        bitrate_text = per_track_dialog.get_bitrate()
+        if bitrate_text:
+            bitrate_value = bitrate_text.split()[0] + 'k'
+        self.logger.log(f'[CONVERT_FLOW] Bitrate from per-track dialog: {bitrate_value}')
+        
+        # Build filter chains with actual file durations
+        from utils.audio_utils import build_audio_filter_chain, get_audio_duration
+        per_track_filters = {}
+        for file_path, track_settings in per_track_settings.items():
+            converted_settings = self._convert_per_track_to_audio_options(track_settings)
+            # Get actual file duration for proper fade-out calculation
+            file_duration_minutes = get_audio_duration(file_path)
+            audio_filter = build_audio_filter_chain(converted_settings, file_duration_minutes=file_duration_minutes)
+            per_track_filters[file_path] = audio_filter
+        
+        self.logger.log(f'[CONVERT_FLOW] Per-track filters built: {len(per_track_filters)} filter(s)')
+        
+        # Now run the actual conversion with the per-track filters
+        self._run_audio_conversion(files, mod_name, bitrate_value, per_track_filters)
+    
+    def _on_split_error(self, error_msg: str):
+        """Worker thread encountered error."""
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.stop_animation()
+            self.progress_dialog.close()
+        
+        QMessageBox.critical(self, 'Audio Splitting Error', error_msg)
+        self.logger.error(error_msg)
+    
+    def _show_split_preview(self, split_metadata: dict, files_to_add: list):
+        """Show split preview dialog on GUI thread."""
+        preview_dialog = SplitPreviewDialog(
+            parent=self,
+            split_metadata=split_metadata
+        )
+        preview_dialog.exec_()
+        choice = preview_dialog.get_choice()
+        
+        if choice != "PROCEED":
+            self.logger.log('User cancelled after split preview - cleaning up temporary WAV segments')
+            # Cleanup WAV files since conversion won't happen
+            import shutil
+            temp_dirs_to_remove = set()
+            
+            for wav_file in files_to_add:
+                if wav_file.endswith('.wav') and os.path.isfile(wav_file):
+                    try:
+                        # Track temp directory for cleanup
+                        wav_dir = os.path.dirname(wav_file)
+                        temp_dir = os.path.join(wav_dir, '.starsound_splits_temp')
+                        if os.path.isdir(temp_dir):
+                            temp_dirs_to_remove.add(temp_dir)
+                        
+                        # Remove the WAV file
+                        os.remove(wav_file)
+                        self.logger.log(f'[CLEANUP] Removed cancelled segment: {os.path.basename(wav_file)}')
+                    except Exception as e:
+                        self.logger.warn(f'[CLEANUP] Could not remove WAV file {os.path.basename(wav_file)}: {e}')
+            
+            # Cleanup temp directories
+            for temp_dir in temp_dirs_to_remove:
+                try:
+                    if os.path.isdir(temp_dir):
+                        shutil.rmtree(temp_dir)
+                        self.logger.log(f'[CLEANUP] Removed temp directory: {os.path.basename(temp_dir)}')
+                except Exception as e:
+                    self.logger.warn(f'[CLEANUP] Could not remove temp directory {temp_dir}: {e}')
+
+    def _perform_file_splitting_worker(
+        self,
+        segment_length: int | dict = 25,
+        files_to_split: list = None,
+        progress_callback=None
+    ) -> dict:
+        """
+        Perform actual FFmpeg splitting for files (WORKER THREAD ONLY).
+        This method runs on the worker thread - NO Qt objects created here.
+        All progress updates use progress_callback to emit signals to GUI thread.
+        
+        Args:
+            segment_length: Either int (single value) or dict (per-file values)
+            files_to_split: List of file paths to split
+            progress_callback: Function(filename, current_num, total_num) to report progress
+        
+        Returns:
+            dict with keys:
+                - success: bool (True if all splits successful)
+                - files_to_remove: list of original file paths
+                - files_to_add: list of split segment paths
+                - split_metadata: dict of metadata for preview
+                - segment_origins: dict mapping segments to original files
+                - error: str (error message if success=False)
+        """
+        from utils.audio_utils import split_audio_file, get_audio_duration
+        import os
+        
+        # Initialize segment origin tracking
+        if not hasattr(self, 'segment_origins'):
+            self.segment_origins = {}
+        
+        # Track results to return to GUI thread
+        files_to_remove = []
+        files_to_add = []
+        split_metadata = {}
+        
+        # Prepare segment lengths
+        if isinstance(segment_length, int):
+            per_file_segment_lengths = {
+                file_path: segment_length
+                for file_path in (files_to_split or [])
+            }
+        else:
+            per_file_segment_lengths = segment_length or {}
+        
+        # Process each file that needs splitting
+        if not files_to_split:
+            return {'success': True, 'files_to_remove': [], 'files_to_add': [],
+                    'split_metadata': {}, 'segment_origins': self.segment_origins}
+        
+        total_files = len(files_to_split)
+        file_count = 0
+        
+        for file_path in files_to_split:
+            filename = os.path.basename(file_path)
+            file_count += 1
+            
+            # Report progress via callback (emits signal to GUI thread)
+            if progress_callback:
+                progress_callback(filename, file_count, total_files)
+            
+            # Get segment length for this file
+            segment_length_minutes = per_file_segment_lengths.get(file_path, 25)
+            self.logger.log(
+                f'Starting FFmpeg split: {filename} ({segment_length_minutes} min segments)'
+            )
+            
+            # Perform the split (this is the actual FFmpeg work)
+            result = split_audio_file(
+                file_path,
+                segment_length_minutes=segment_length_minutes,
+                logger=self.logger
+            )
+            
+            if result['success']:
+                self.logger.log(
+                    f'Split successful: {result["segment_count"]} segments created'
+                )
+                files_to_remove.append(file_path)
+                files_to_add.extend(result['split_files'])
+                
+                # SEGMENT TRACKING: Map each segment back to original
+                for segment_path in result['split_files']:
+                    self.segment_origins[segment_path] = file_path
+                    segment_name = os.path.basename(segment_path)
+                    self.logger.log(
+                        f'[SEGMENT_TRACK] {segment_name} origin: {filename}'
+                    )
+                
+                # Store metadata for preview
+                original_duration = get_audio_duration(file_path)
+                split_metadata[filename] = {
+                    'original_duration': original_duration,
+                    'segments': result['split_files'],
+                    'segment_durations': result['segment_durations']
+                }
+            else:
+                # Split failed - return error
+                error_msg = f"Split failed for {filename}: {result['message']}"
+                self.logger.error(error_msg)
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'message': result['message'],
+                    'files_to_remove': [],
+                    'files_to_add': [],
+                    'split_metadata': {}
+                }
+        
+        # All splits completed successfully
+        return {
+            'success': True,
+            'files_to_remove': files_to_remove,
+            'files_to_add': files_to_add,
+            'split_metadata': split_metadata,
+            'segment_origins': self.segment_origins
+        }
 
     def convert_audio(self):
         import os
@@ -3650,7 +4716,7 @@ QGroupBox {{
             
             # STEP 2: Show split configuration dialog (per-file segment lengths)
             self.logger.log('[CONVERT_FLOW] STEP 2: Showing per-file split configuration dialog')
-            from per_file_split_config_dialog import PerFileSplitConfigDialog
+            from dialogs.per_file_split_config_dialog import PerFileSplitConfigDialog
             split_config_dialog = PerFileSplitConfigDialog(self.files_needing_split, self)
             split_config_dialog.exec_()
             
@@ -3689,10 +4755,21 @@ QGroupBox {{
         # Perform actual splitting with per-file segment lengths
         if self.files_needing_split:
             self.logger.log('[CONVERT_FLOW] STEP 3: Performing file splitting with per-file configuration')
+            # Store converter state so we can continue AFTER split completes (split runs in worker thread)
+            self.converter_state = {
+                'files': files,
+                'mod_name': mod_name,
+                'bitrate_value': bitrate_value,
+                'files_needing_split': True
+            }
             proceed = self.perform_file_splitting(per_file_segment_lengths)
             if not proceed:
                 self.logger.log('File splitting failed, aborting conversion')
+                self.converter_state = None
                 return
+            # Code stops here; conversion continues in _on_split_finished() when worker finishes
+            self.logger.log('[CONVERT_FLOW] Split worker started in background. Waiting for completion...')
+            return
         else:
             self.logger.log('[CONVERT_FLOW] No files need splitting, proceeding to conversion')
         
@@ -3705,10 +4782,25 @@ QGroupBox {{
         if len(files) > 1:
             self.logger.log(f'[CONVERT_FLOW] Multiple files ({len(files)}) detected - showing per-track config')
             
-            # Use empty defaults since first audio dialog was skipped for multiple files
-            # (Per-track dialog only shows when len(files) > 1, which means first dialog didn't show)
-            audio_processing_options = {}
-            self.logger.log('[CONVERT_FLOW] Multiple files mode - using empty defaults for per-track dialog')
+            # Use sensible defaults for multiple files mode (first audio dialog was skipped)
+            # Defaults match audio_processing_dialog values
+            audio_processing_options = {
+                'trim': True,
+                'silence_trim': True,
+                'sonic_scrubber': True,
+                'compression': True,
+                'compression_preset': 'Moderate (balanced)',
+                'soft_clip': True,
+                'eq': True,
+                'eq_preset': 'Warm (bass-heavy)',
+                'normalize': True,
+                'fade': True,  # CRITICAL: Must be enabled for proper audio processing
+                'fade_in_duration': '0hr0m0.5s',
+                'fade_out_duration': '0hr0m5s',
+                'de_esser': False,
+                'stereo_to_mono': False,
+            }
+            self.logger.log('[CONVERT_FLOW] Multiple files mode - using full defaults for per-track dialog (including fade)')
             
             # Pass segment_origins if they exist (enables segment grouping in dialog)
             segment_origins = getattr(self, 'segment_origins', {})
@@ -3734,129 +4826,185 @@ QGroupBox {{
                     bitrate_value = bitrate_text.split()[0] + 'k'
                 self.logger.log(f'[CONVERT_FLOW] Bitrate selected from per-track dialog: {bitrate_value}')
             
-            # Build individual filter chain for each file
-            from utils.audio_utils import build_audio_filter_chain
+            # Build individual filter chain for each file with actual file durations
+            from utils.audio_utils import build_audio_filter_chain, get_audio_duration
             for file_path, track_settings in per_track_settings.items():
                 # Convert from per-track format (with _enabled suffix) to audio_processing_dialog format
                 converted_settings = self._convert_per_track_to_audio_options(track_settings)
                 
-                # DEBUG: Log converted settings to verify silence_trim is OFF
-                import os
-                self.logger.log(f'[CONVERT_DEBUG] File: {os.path.basename(file_path)}')
-                self.logger.log(f'[CONVERT_DEBUG]   silence_trim_enabled (before): {track_settings.get("silence_trim_enabled")}')
-                self.logger.log(f'[CONVERT_DEBUG]   silence_trim (after convert): {converted_settings.get("silence_trim")}')
-                
-                audio_filter = build_audio_filter_chain(converted_settings)
+                # Get actual file duration for proper fade-out calculation
+                file_duration_minutes = get_audio_duration(file_path)
+                audio_filter = build_audio_filter_chain(converted_settings, file_duration_minutes=file_duration_minutes)
                 per_track_filters[file_path] = audio_filter
-                import os
-                self.logger.log(f'[CONVERT_FLOW] Added filter for: {os.path.basename(file_path)} ({len(audio_filter)} chars)')
             
             self.logger.log(f'[CONVERT_FLOW] Per-track filters built: {len(per_track_filters)} filter(s) ready')
         else:
             # Single file or no files - use uniform settings
             self.logger.log('[CONVERT_FLOW] Single file or no files - using uniform audio processing')
             audio_processing_options = self.audio_dialog.get_audio_processing_options()
-            from utils.audio_utils import build_audio_filter_chain
-            audio_filter = build_audio_filter_chain(audio_processing_options)
-            per_track_filters = {file_path: audio_filter for file_path in files}
-            self.logger.log(f'[CONVERT_FLOW] Uniform filter chain ({len(audio_filter)} chars) applied to all {len(files)} file(s)')
+            from utils.audio_utils import build_audio_filter_chain, get_audio_duration
+            for file_path in files:
+                # Get actual file duration for proper fade-out calculation
+                file_duration_minutes = get_audio_duration(file_path)
+                audio_filter = build_audio_filter_chain(audio_processing_options, file_duration_minutes=file_duration_minutes)
+                per_track_filters[file_path] = audio_filter
+            self.logger.log(f'[CONVERT_FLOW] Uniform filter chain applied to all {len(files)} file(s) with actual durations')
         
-        # ===== SETUP CONVERSION ENVIRONMENT =====
-        # Use StarSound staging directory for all conversions
+        # ===== PERFORM CONVERSION =====
+        self._run_audio_conversion(files, mod_name, bitrate_value, per_track_filters)
+    
+    def _run_audio_conversion(self, files: list, mod_name: str, bitrate_value: str, per_track_filters: dict):
+        """
+        Run audio conversion in parallel using ThreadPoolExecutor.
+        Converts 2-3 files simultaneously for ~2-3x speedup.
+        Used by both normal convert_audio() and post-split conversion workflow.
+        """
+        import os
+        import threading
+        from pathlib import Path
+        from utils.atomicwriter import backup_and_convert_audio, create_mod_folder_structure
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        # Setup conversion environment
         starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
-        from atomicwriter import backup_and_convert_audio, create_mod_folder_structure
         staging_dir = starsound_dir / 'staging'
         safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
         mod_path = staging_dir / safe_mod_name
+        backup_root = self._get_backup_path(mod_name)  # Get root backup path
+        
+        # Clean up any old backups folder in staging (now centralized in root)
+        try:
+            old_staging_backups = mod_path / 'backups'
+            if old_staging_backups.exists():
+                import shutil
+                shutil.rmtree(old_staging_backups)
+                self.logger.log(f'[CLEANUP] Removed old staging backups: {old_staging_backups}')
+        except Exception as e:
+            self.logger.warn(f'[CLEANUP] Could not remove old staging backups: {e}')
+        
         self.logger.update_metadata(mod_path=str(mod_path))
         create_mod_folder_structure(staging_dir, safe_mod_name)
-        import threading
         
-        # DEBUG: Log the exact files being converted before loop starts
-        self.logger.log(f'[CONVERSION_START] About to convert {len(files)} file(s):')
+        self.logger.log(f'[CONVERSION_START] About to convert {len(files)} file(s) in parallel:')
         for idx, fp in enumerate(files):
-            import os
             self.logger.log(f'  [{idx+1}] {os.path.basename(fp)}')
         
-        def run_conversion():
-            self.ffmpeg_log_signal.emit('CLEAR')
+        def convert_single_file(file_path):
+            """
+            Convert a single file to OGG. Returns tuple: (success, msg, ogg_path, is_wav).
+            This runs in the thread pool (one file per thread).
+            """
+            def ffmpeg_log_callback(text):
+                self.ffmpeg_log_signal.emit(text)
+            
+            self.logger.log(f'[PARALLEL] Starting conversion: {os.path.basename(file_path)}')
+            
+            # Get audio filter for this file
+            audio_filter = per_track_filters.get(file_path, '')
+            if not audio_filter:
+                self.logger.warn(f'[MISMATCH] No filter for {os.path.basename(file_path)}')
+            
+            # Perform conversion
+            success, msg, ogg_path = backup_and_convert_audio(
+                file_path, str(mod_path), bitrate=bitrate_value,
+                audio_filter=audio_filter, ffmpeg_log_callback=ffmpeg_log_callback,
+                backup_path=str(backup_root)
+            )
+            
+            is_wav = file_path.endswith('.wav')
+            self.logger.log(f'[PARALLEL] Completed: {os.path.basename(file_path)} - {"✓ Success" if success else "✗ Failed"}')
+            
+            return (success, msg, ogg_path, is_wav, file_path)
+        
+        def run_parallel_conversion():
             converted_count = 0
             failed_count = 0
             error_messages = []
             wav_files_to_cleanup = []
             
-            for file_path in files:
-                def ffmpeg_log_callback(text):
-                    self.ffmpeg_log_signal.emit(text)
-                self.logger.log(f'User started audio conversion for: {file_path}')
-                
-                # Get the per-track audio filter for this file
-                audio_filter = per_track_filters.get(file_path, '')
-                if not audio_filter:
-                    import os
-                    self.logger.warn(f'[MISMATCH] No filter found for {os.path.basename(file_path)} (per_track_filters has {len(per_track_filters)} entries)')
-                
-                success, msg, ogg_path = backup_and_convert_audio(
-                    file_path, str(mod_path), bitrate=bitrate_value, audio_filter=audio_filter, ffmpeg_log_callback=ffmpeg_log_callback)
-                
-                # Track WAV files for cleanup REGARDLESS of success (they're temporary segments from splitting)
-                if file_path.endswith('.wav'):
-                    wav_files_to_cleanup.append(file_path)
-                
-                if success:
-                    converted_count += 1
-                    # Show only the output OGG filename
-                    import os
-                    ogg_filename = os.path.basename(ogg_path) if ogg_path else os.path.basename(file_path)
-                    self.completed_files_signal.emit(ogg_filename)
-                else:
-                    failed_count += 1
-                    import os
-                    file_display = os.path.basename(file_path)
-                    error_msg = f'{file_display}: {msg}' if msg else f'{file_display}: Conversion failed'
-                    error_messages.append(error_msg)
-                    self.logger.error(error_msg)
+            self.ffmpeg_log_signal.emit('CLEAR')
             
-            # Cleanup temporary WAV segment files after conversion completes (success or failure)
+            # Use ThreadPoolExecutor for parallel conversion (2-3 files at once)
+            max_workers = min(3, len(files))  # Limit to 3 parallel conversions, or fewer if less files
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all file conversions to the thread pool
+                futures = {
+                    executor.submit(convert_single_file, file_path): file_path
+                    for file_path in files
+                }
+                
+                self.logger.log(f'[PARALLEL] Started {max_workers} parallel conversion worker(s)')
+                
+                # Process completions as they finish (not in order)
+                for future in as_completed(futures):
+                    try:
+                        success, msg, ogg_path, is_wav, file_path = future.result()
+                        
+                        # Track WAV files for cleanup
+                        if is_wav:
+                            wav_files_to_cleanup.append(file_path)
+                        
+                        if success:
+                            converted_count += 1
+                            original_filename = os.path.basename(file_path)
+                            ogg_filename = os.path.basename(ogg_path) if ogg_path else original_filename
+                            
+                            # Show both original and converted if they differ significantly
+                            # (handles Unicode/special character files that get sanitized)
+                            if ogg_filename != original_filename.replace('.mp3', '.ogg').replace('.wav', '.ogg'):
+                                display_text = f'{original_filename} → {ogg_filename}'
+                            else:
+                                display_text = ogg_filename
+                            
+                            self.completed_files_signal.emit(display_text)
+                        else:
+                            failed_count += 1
+                            file_display = os.path.basename(file_path)
+                            error_msg = f'{file_display}: {msg}' if msg else f'{file_display}: Conversion failed'
+                            error_messages.append(error_msg)
+                            self.logger.error(error_msg)
+                    
+                    except Exception as e:
+                        failed_count += 1
+                        self.logger.error(f'[PARALLEL] Conversion thread error: {e}')
+                        error_messages.append(f'Thread error: {str(e)[:50]}')
+            
+            self.logger.log(f'[PARALLEL] All conversions complete: {converted_count} success, {failed_count} failed')
+            
+            # Cleanup temporary WAV segments
             if wav_files_to_cleanup:
-                import os
                 import shutil
                 cleanup_count = 0
                 temp_dirs_to_remove = set()
                 
                 for wav_file in wav_files_to_cleanup:
                     try:
-                        # Track temp directory for cleanup
                         wav_dir = os.path.dirname(wav_file)
                         temp_dir = os.path.join(wav_dir, '.starsound_splits_temp')
                         if os.path.isdir(temp_dir):
                             temp_dirs_to_remove.add(temp_dir)
                         
-                        # Remove WAV file
                         if os.path.isfile(wav_file):
                             os.remove(wav_file)
                             cleanup_count += 1
-                            self.logger.log(f'[CLEANUP] Removed temporary WAV segment: {os.path.basename(wav_file)}')
+                            self.logger.log(f'[CLEANUP] Removed temporary WAV: {os.path.basename(wav_file)}')
                     except Exception as e:
-                        self.logger.warn(f'[CLEANUP] Could not remove WAV file {os.path.basename(wav_file)}: {e}')
+                        self.logger.warn(f'[CLEANUP] Could not remove WAV: {os.path.basename(wav_file)}: {e}')
                 
-                # Cleanup temp directories
                 for temp_dir in temp_dirs_to_remove:
                     try:
                         if os.path.isdir(temp_dir):
                             shutil.rmtree(temp_dir)
-                            self.logger.log(f'[CLEANUP] Removed temp directory: .starsound_splits_temp')
+                            self.logger.log(f'[CLEANUP] Removed temp directory')
                     except Exception as e:
-                        self.logger.warn(f'[CLEANUP] Could not remove temp directory: {e}')
-                
-                if cleanup_count > 0:
-                    self.logger.log(f'[CLEANUP] Cleaned up {cleanup_count} WAV segment file(s)')
+                        self.logger.warn(f'[CLEANUP] Could not remove temp dir: {e}')
             
-            # Conversion summary
+            # Summary
             if converted_count and failed_count:
                 summary = f'{converted_count} file(s) converted, {failed_count} failed.'
                 if error_messages:
-                    summary += '\n\nErrors:\n' + '\n'.join(error_messages[:5])  # Show first 5 errors
+                    summary += '\n\nErrors:\n' + '\n'.join(error_messages[:5])
                     if len(error_messages) > 5:
                         summary += f'\n... and {len(error_messages) - 5} more error(s).'
             elif failed_count:
@@ -3869,11 +5017,13 @@ QGroupBox {{
                 summary = f'All files converted successfully! ({converted_count})'
             else:
                 summary = 'No files converted.'
+            
             self.audio_status_signal.emit(summary)
-            # Auto-save after conversion completes
             if converted_count > 0:
                 self._auto_save_mod_state('audio conversion')
-        threading.Thread(target=run_conversion, daemon=True).start()
+        
+        # Run parallel conversion in background thread
+        threading.Thread(target=run_parallel_conversion, daemon=True).start()
 
     def _convert_per_track_to_audio_options(self, per_track_settings: dict) -> dict:
         """
@@ -3941,7 +5091,7 @@ QGroupBox {{
         if not hasattr(self, 'audio_status_label'):
             self.audio_status_label = QLabel('')
         
-        # CLEANUP & VALIDATION: Ensure backup folders are organized correctly
+        # CLEANUP & VALIDATION: Pre-generation setup
         try:
             mod_name = self.modname_input.text().strip() if hasattr(self, 'modname_input') else ''
             if mod_name:
@@ -3949,12 +5099,12 @@ QGroupBox {{
                 staging_dir = starsound_dir / 'staging'
                 safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
                 
-                # Validate and fix backups folder structure
-                backups_originals = staging_dir / safe_mod_name / 'backups' / 'originals'
-                backups_converted = staging_dir / safe_mod_name / 'backups' / 'converted'
+                # Validate and fix backups folder structure (located at root backups/)
+                backup_root = self._get_backup_path(safe_mod_name)
+                backups_originals = backup_root / 'originals'
+                backups_converted = backup_root / 'converted'
                 
                 if backups_originals.exists():
-                    # Move any .ogg files from originals to converted
                     for ogg_file in backups_originals.glob('*.ogg'):
                         try:
                             converted_dest = backups_converted / ogg_file.name
@@ -3963,7 +5113,6 @@ QGroupBox {{
                         except Exception as e:
                             self.logger.warn(f'[MIGRATE] Could not move OGG: {ogg_file.name} ({e})')
                     
-                    # Remove any .ogg remaining in originals (fallback cleanup)
                     for ogg_file in backups_originals.glob('*.ogg'):
                         try:
                             ogg_file.unlink()
@@ -3973,58 +5122,22 @@ QGroupBox {{
         except Exception as e:
             self.logger.warn(f'[VALIDATION] Pre-generation validation had issues: {e}')
         
-        # FIRST: Ask user for output format (Loose Files vs Pak)
-        # This is the final decision before generation
+        # Ask user for output format
         format_choice = self._show_format_selection_dialog()
         if not format_choice:
-            # User cancelled
             return
         
-        self.output_format = format_choice  # 'pak' or 'loose'
+        self.output_format = format_choice
         self.settings.set('last_output_format', format_choice)
         
         self.audio_status_label.setText('🔔 Generate Mod button clicked!')
         self.update_selected_tracks_label()
-        self.logger.log('generate_patch_file() called')
+        self.logger.log('generate_patch_file() called - launching threaded worker')
         self.logger.log('User started patch generation')
         self.logger.update_metadata(last_action='Generate Patch Clicked')
         
-        # 🔍 DEBUG: Log the current workflow state at generation time
-        current_patch_mode = getattr(self, 'patch_mode', 'UNDEFINED')
-        current_replace_selections = getattr(self, 'replace_selections', {})
-        current_add_selections = getattr(self, 'add_selections', {})
-        current_day_tracks = getattr(self, 'day_tracks', [])
-        current_night_tracks = getattr(self, 'night_tracks', [])
-        current_selected_biomes = getattr(self, 'selected_biomes', [])
-        
-        print(f'[WORKFLOW_STATE_AT_GENERATION]')
-        print(f'  patch_mode: {current_patch_mode}')
-        print(f'  replace_selections: {type(current_replace_selections).__name__}, keys={list(current_replace_selections.keys())[:5]}...')
-        print(f'  add_selections: {type(current_add_selections).__name__}, keys={list(current_add_selections.keys())[:5] if current_add_selections else "EMPTY"}')
-        print(f'  day_tracks: {len(current_day_tracks)} items')
-        print(f'  night_tracks: {len(current_night_tracks)} items')
-        print(f'  selected_biomes: {current_selected_biomes}')
-        
-        self.logger.log('[WORKFLOW_STATE] At generation time:', context='StateDebug')
-        self.logger.log(f'  patch_mode={current_patch_mode}', context='StateDebug')
-        self.logger.log(f'  replace_selections has {len(current_replace_selections)} biomes', context='StateDebug')
-        self.logger.log(f'  add_selections has {len(current_add_selections)} biomes', context='StateDebug')
-        self.logger.log(f'  day_tracks={len(current_day_tracks)}, night_tracks={len(current_night_tracks)}', context='StateDebug')
-        self.logger.log(f'  selected_biomes={current_selected_biomes}', context='StateDebug')
-        
-        # Initialize patch_results early so it's always defined
-        patch_results = []
-        
+        # Validate inputs before launching thread
         mod_name = self.modname_input.text().strip() if hasattr(self, 'modname_input') else ''
-        if mod_name:
-            self.settings.set('last_mod_name', mod_name)  # Save mod name before generation
-            # Also save to mod_saves for configuration continuity
-            try:
-                mod_state = self._gather_current_mod_state()
-                self.mod_save_manager.save_mod(mod_name, mod_state)
-                print(f'[PERSIST] Saved mod config to mod_saves before generation')
-            except Exception as e:
-                print(f'[ERROR] Failed to save mod config: {e}')
         if not mod_name:
             self.audio_status_label.setText('❌ Please enter a mod name in Step 1.')
             self.update_selected_tracks_label()
@@ -4032,7 +5145,6 @@ QGroupBox {{
             self.logger.warn('Generate Patch: No mod name selected.')
             return
         
-        # Check selected_biomes list instead of biome_input
         biomes = getattr(self, 'selected_biomes', [])
         if not biomes:
             self.audio_status_label.setText('❌ Please select a biome.')
@@ -4043,262 +5155,124 @@ QGroupBox {{
         
         patch_mode = getattr(self, 'patch_mode', 'add')
         replace_selections = getattr(self, 'replace_selections', {})
+        add_selections = getattr(self, 'add_selections', {})
+        day_tracks = getattr(self, 'day_tracks', [])
+        night_tracks = getattr(self, 'night_tracks', [])
         
-        # DEBUG: Log the current state for troubleshooting
-        self.logger.log(f'[DEBUG_PATCH] patch_mode={patch_mode}, has_replace_selections={bool(replace_selections)}, replace_keys={list(replace_selections.keys()) if replace_selections else "NONE"}', context='PatchGen')
-        print(f'[PATCH_DEBUG] patch_mode={patch_mode}, replace_selections type={type(replace_selections)}, len={len(replace_selections) if isinstance(replace_selections, dict) else "N/A"}')
+        # Validate we have tracks
+        has_tracks = bool(day_tracks or night_tracks or add_selections or replace_selections)
+        if not has_tracks:
+            self.audio_status_label.setText('❌ Please add at least one track.')
+            self.update_selected_tracks_label()
+            QMessageBox.warning(self, 'Input Error', 'Please add at least one track.')
+            self.logger.warn('Generate Patch: No tracks selected.')
+            return
         
-        # CASE A: Replace feature with individual track selections (Replace mode only)
-        if patch_mode == 'replace' and replace_selections:
-            self.logger.log('Using Replace feature with individual track selections', context='PatchGen')
-            
-            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
-            staging_dir = starsound_dir / 'staging'
-            safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-            mod_path = staging_dir / safe_mod_name
-            self.logger.update_metadata(mod_path=str(mod_path))
-            
-            from utils.patch_generator import generate_patch
-            patch_results = []
-            
-            for biome_category, biome_name in biomes:
-                # Get selections for this biome
-                selections = replace_selections.get((biome_category, biome_name), {})
-                if not selections:
-                    self.logger.warn(f'No selections for {biome_category}/{biome_name}')
-                    continue
-                
-                config = {
-                    'biome': biome_name,
-                    'biome_category': biome_category,
-                    'modName': mod_name,
-                    'patchMode': patch_mode
-                }
-                
-                result = generate_patch(str(mod_path), config, replace_selections=selections, logger=self.logger)
-                patch_results.append(result)
+        # Save mod state before starting
+        try:
+            mod_state = self._gather_current_mod_state()
+            self.mod_save_manager.save_mod(mod_name, mod_state)
+            self.logger.log('Saved mod config to mod_saves before generation')
+        except Exception as e:
+            self.logger.warn(f'Failed to save mod config: {e}')
         
-        # CASE B: Both mode - Replace specific tracks AND add new tracks
-        elif patch_mode == 'both' and replace_selections:
-            self.logger.log('Using Both mode: Replace + Add feature combined', context='PatchGen')
-            
-            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
-            staging_dir = starsound_dir / 'staging'
-            safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-            mod_path = staging_dir / safe_mod_name
-            self.logger.update_metadata(mod_path=str(mod_path))
-            
-            # Get Add selections (day/night tracks to add)
-            day_tracks = getattr(self, 'day_tracks', [])
-            night_tracks = getattr(self, 'night_tracks', [])
-            add_selections = getattr(self, 'add_selections', {})
-            
-            # Validate that we have both Replace AND Add data
-            has_replace = bool(replace_selections)
-            has_add = bool(day_tracks or night_tracks or add_selections)
-            
-            if not has_replace or not has_add:
-                msg = 'Both mode requires BOTH replacement selections AND new tracks to add'
-                self.audio_status_label.setText(f'❌ {msg}')
-                if not has_replace:
-                    msg = 'No tracks selected for replacement'
-                    self.logger.warn(f'Both mode: {msg}')
-                if not has_add:
-                    msg = 'No tracks selected for adding'
-                    self.logger.warn(f'Both mode: {msg}')
-                QMessageBox.warning(self, 'Input Error', msg)
-                return
-            
-            from utils.patch_generator import generate_patch
-            patch_results = []
-            
-            # 🆕 In Both mode, we must patch ALL biomes that have replacement tracks (replace_selections),
-            # not just the ADD destination biomes (selected_biomes).
-            # Merge replace_selections.keys() with selected_biomes to ensure we patch ocean even if
-            # the user only selected forest and garden for ADD destinations.
-            both_mode_biomes = set(biomes) | set(replace_selections.keys())
-            self.logger.log(f'Both mode: Patching {len(both_mode_biomes)} biomes (replace={len(replace_selections)} + add={len(biomes)})', context='PatchGen')
-            
-            for biome_category, biome_name in both_mode_biomes:
-                # Get REPLACE selections for this biome
-                replace_sel = replace_selections.get((biome_category, biome_name), {})
-                
-                # Get ADD selections for this biome (if using per-biome structure)
-                add_sel = add_selections.get((biome_category, biome_name), {'day': [], 'night': []})
-                day_add_tracks = add_sel.get('day', [])
-                night_add_tracks = add_sel.get('night', [])
-                
-                # If no per-biome add selection, use flat day/night tracks
-                if not day_add_tracks and not night_add_tracks:
-                    day_add_tracks = day_tracks
-                    night_add_tracks = night_tracks
-                
-                # Skip biomes with no replacement selections (but log it)
-                if not replace_sel:
-                    if day_add_tracks or night_add_tracks:
-                        self.logger.log(f'Both mode: {biome_category}/{biome_name} has Add but no Replace', context='PatchGen')
-                    else:
-                        self.logger.log(f'Skipping {biome_category}/{biome_name} (no data)', context='PatchGen')
-                        continue
-                
-                config = {
-                    'biome': biome_name,
-                    'biome_category': biome_category,
-                    'dayTracks': day_add_tracks,
-                    'nightTracks': night_add_tracks,
-                    'modName': mod_name,
-                    'patchMode': 'both'  # Pass 'both' to generator so it knows to combine
-                }
-                
-                self.logger.log(f'Generating Both mode patch for {biome_category}/{biome_name}', context='PatchGen')
-                result = generate_patch(str(mod_path), config, replace_selections=replace_sel, logger=self.logger)
-                patch_results.append(result)
+        # Launch worker thread with progress dialog
+        self._launch_patch_generation_worker(mod_name, format_choice)
+    
+    def _launch_patch_generation_worker(self, mod_name, format_choice):
+        """Launch patch generation in a background thread with progress dialog"""
+        # Create and launch worker
+        self.patch_worker = PatchGenerationWorker(self, mod_name, format_choice)
         
-        # CASE C: Standard Add/Replace feature (old behavior)
-        else:
-            self.logger.log('Using standard Add/Replace feature', context='PatchGen')
-            
-            # Check if using new per-biome add_selections structure
-            add_selections = getattr(self, 'add_selections', {})
-            has_add_selections = bool(add_selections)
-            
-            if has_add_selections:
-                # New per-biome structure: each biome has its own day/night tracks
-                self.logger.log('Detected per-biome add_selections, using new Add mode flow', context='PatchGen')
-                
-                # Verify at least one biome has tracks
-                total_tracks = 0
-                for biome_key, tracks_dict in add_selections.items():
-                    total_tracks += len(tracks_dict.get('day', [])) + len(tracks_dict.get('night', []))
-                
-                if total_tracks == 0:
-                    self.audio_status_label.setText('❌ Please add at least one track to at least one biome.')
-                    self.update_selected_tracks_label()
-                    QMessageBox.warning(self, 'Input Error', 'Please add at least one track to at least one biome.')
-                    self.logger.warn('Generate Patch: No tracks selected in any biome.')
-                    return
-            else:
-                # Old flat structure: same tracks applied to all biomes
-                self.logger.log('Using legacy flat track lists for Add mode', context='PatchGen')
-                
-                day_tracks = self.day_tracks if hasattr(self, 'day_tracks') else []
-                night_tracks = self.night_tracks if hasattr(self, 'night_tracks') else []
-                if not day_tracks and not night_tracks:
-                    self.audio_status_label.setText('❌ Please add at least one track.')
-                    self.update_selected_tracks_label()
-                    QMessageBox.warning(self, 'Input Error', 'Please add at least one track.')
-                    self.logger.warn('Generate Patch: No tracks selected.')
-                    return
-                
-                # Step 6: Track type selection (only needed for legacy flat structure)
-                track_type = self.selected_track_type if hasattr(self, 'selected_track_type') else None
-                if not track_type:
-                    if day_tracks and night_tracks:
-                        track_type = 'Both'
-                        self.logger.log('Inferred track_type=Both from saved tracks', context='PatchGen')
-                    elif day_tracks:
-                        track_type = 'Day'
-                        self.logger.log('Inferred track_type=Day from saved tracks', context='PatchGen')
-                    elif night_tracks:
-                        track_type = 'Night'
-                        self.logger.log('Inferred track_type=Night from saved tracks', context='PatchGen')
-                
-                if not track_type:
-                    self.audio_status_label.setText('❌ Please select Day, Night, or Both in Step 6.')
-                    self.update_selected_tracks_label()
-                    QMessageBox.warning(self, 'Input Error', 'Please select Day, Night, or Both in Step 6.')
-                    self.logger.warn('Generate Patch: No track type selected.')
-                    return
-            
-            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
-            staging_dir = starsound_dir / 'staging'
-            safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-            mod_path = staging_dir / safe_mod_name
-            self.logger.update_metadata(mod_path=str(mod_path))
-            
-            from utils.patch_generator import generate_patch
-            patch_results = []
-            
-            for biome_category, biome_name in biomes:
-                if has_add_selections:
-                    # New per-biome structure: get tracks-specific for this biome
-                    biome_key = (biome_category, biome_name)
-                    biome_tracks = add_selections.get(biome_key, {'day': [], 'night': []})
-                    day_biome_tracks = biome_tracks.get('day', [])
-                    night_biome_tracks = biome_tracks.get('night', [])
-                    
-                    if not day_biome_tracks and not night_biome_tracks:
-                        self.logger.log(f'Skipping {biome_category}/{biome_name} (no tracks selected)', context='PatchGen')
-                        continue
-                    
-                    config = {
-                        'biome': biome_name,
-                        'biome_category': biome_category,
-                        'dayTracks': day_biome_tracks,
-                        'nightTracks': night_biome_tracks,
-                        'modName': mod_name,
-                        'patchMode': patch_mode,
-                        'trackType': 'Both',  # Always 'Both' for per-biome (day/night handled separately)
-                        'remove_vanilla_tracks': self.remove_vanilla_tracks  # 🆕 Include checkbox state
-                    }
-                    self.logger.log(f'Generating patch for {biome_category}/{biome_name} with {len(day_biome_tracks)} day + {len(night_biome_tracks)} night tracks (remove_vanilla={self.remove_vanilla_tracks})', context='PatchGen')
-                else:
-                    # Old flat structure: apply same tracks to all biomes
-                    config = {
-                        'biome': biome_name,
-                        'biome_category': biome_category,
-                        'dayTracks': day_tracks,
-                        'nightTracks': night_tracks,
-                        'modName': mod_name,
-                        'patchMode': patch_mode,
-                        'trackType': track_type,
-                        'remove_vanilla_tracks': self.remove_vanilla_tracks  # 🆕 Include checkbox state
-                    }
-
-                result = generate_patch(str(mod_path), config, logger=self.logger)
-                patch_results.append(result)
+        # Create progress dialog
+        progress_dialog = QMessageBox(self)
+        progress_dialog.setWindowFlags(progress_dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        progress_dialog.setWindowTitle('🔧 Generating Mod...')
+        progress_dialog.setText('⏳ Generating patch files...\n(This window will close when done)')
+        progress_dialog.setStandardButtons(QMessageBox.NoButton)  # No buttons while working
+        progress_dialog.setMinimumWidth(400)
+        
+        # Status label for updates
+        status_label = QLabel('Initializing...')
+        layout = progress_dialog.layout()
+        layout.addWidget(status_label, 1, 1)
+        
+        # Connect signals
+        self.patch_worker.progress_update.connect(lambda msg: status_label.setText(msg))
+        self.patch_worker.generation_complete.connect(
+            lambda result: self._on_patch_generation_complete(result, progress_dialog, mod_name)
+        )
+        
+        # Start worker
+        self.patch_worker.start()
+        progress_dialog.exec_()
+    
+    def _on_patch_generation_complete(self, result, progress_dialog, mod_name):
+        """Handle patch generation completion"""
+        # Close progress dialog
+        progress_dialog.accept()  # Use accept() for modal dialogs instead of close()
+        
+        # Process results
+        success = result.get('success', False)
+        patch_results = result.get('results', [])
+        error_msg = result.get('error_msg', None)
         
         self.update_selected_tracks_label()
         
-        # Check if any patches were created
+        if error_msg:
+            self.audio_status_label.setText(f'❌ Generation Error: {error_msg}')
+            self.logger.error(f'Patch generation error: {error_msg}')
+            QMessageBox.critical(self, 'Generation Error', f'Patch generation failed:\n\n{error_msg}')
+            return
+        
         if not patch_results:
             self.audio_status_label.setText('❌ No patches were generated')
-            self.logger.error('No patches generated - patch_results is empty')
+            self.logger.error('No patches generated')
             QMessageBox.warning(self, 'Generation Failed', 'No patches were generated. Please check your selections.')
             return
         
-        # Check if all patches were successful
+        # Check if all successful
         all_success = all(r.get('success') for r in patch_results)
+        
         if all_success:
             paths = [r['patchPath'] for r in patch_results]
-            # Count files: use filesCopied if available (Replace mode), otherwise count tracks (Add mode)
             total_files = sum(len(r.get('filesCopied', [])) for r in patch_results)
             if total_files == 0:
-                # For Add mode, count the actual tracks being used
-                # Check if using new per-biome add_selections structure
                 add_selections = getattr(self, 'add_selections', {})
                 if add_selections:
-                    # Count tracks from per-biome structure
                     total_files = 0
                     for biome_key, tracks_dict in add_selections.items():
                         total_files += len(tracks_dict.get('day', [])) + len(tracks_dict.get('night', []))
-                    self.logger.log(f'Counted {total_files} tracks from per-biome add_selections', context='PatchGen')
                 else:
-                    # Fall back to flat track lists
                     day_tracks = self.day_tracks if hasattr(self, 'day_tracks') else []
                     night_tracks = self.night_tracks if hasattr(self, 'night_tracks') else []
                     total_files = len(day_tracks) + len(night_tracks)
+            
             status_text = f"✅ Patches created for {len(paths)} biome(s) with {total_files} music file(s)"
             self.audio_status_label.setText(status_text)
             self.logger.log(status_text)
+            
             for path in paths:
                 self.logger.log(f"  • {path}")
-            # Log all copied files
             for r in patch_results:
                 for filename in r.get('filesCopied', []):
                     self.logger.log(f"    ✓ Copied: {filename}")
                 for error in r.get('copyErrors', []):
                     self.logger.warn(f"    ✗ {error}")
+            
+            # Show completion message and export dialog
+            QMessageBox.information(
+                self,
+                'Generation Complete! ✅',
+                '🌍 IMPORTANT: Music Patches && New Worlds\n\n'
+                'Starbound bakes music into world files at generation time.\n\n'
+                '✓ Your music will appear in: NEW worlds created AFTER installing\n'
+                '✗ Your music will NOT appear in: EXISTING worlds created before\n\n'
+                '📝 To update existing worlds: Use the Terraformer tool\n\n'
+                'For testing: Create a new world to hear your music!\n\n'
+                'Your mod is ready to install!'
+            )
+            self._show_export_confirmation_dialog(mod_name)
         else:
             error_msg = "Patch generation failed for some biomes"
             self.audio_status_label.setText(f"❌ {error_msg}")
@@ -4308,27 +5282,6 @@ QGroupBox {{
                     self.logger.error(f"  • {r.get('message', 'Unknown error')}")
             if patch_results:
                 QMessageBox.critical(self, 'Patch Error', patch_results[0].get('message', 'Unknown error'))
-        
-        # If patches created successfully, show IMPORTANT info message then export dialog
-        if all(r.get('success') for r in patch_results) if patch_results else False:
-            # Show critical caveat about new world generation
-            QMessageBox.information(
-                self,
-                'Important: Music Patches & New Worlds',
-                '🌍 IMPORTANT INFORMATION:\n\n'
-                'Starbound bakes music tracklists into world files when they are first generated.\n\n'
-                '✓ Your custom music WILL appear in: NEW WORLDS/S created AFTER this mod is installed\n'
-                '✗ Your custom music will NOT appear in: EXISTING worlds (created before this mod)\n\n'
-                '📝 To safely update music on existing worlds:\n'
-                '  • Use the vanilla Terraformer tool (late-game item)\n'
-                '  • Or spawn it in via admin commands: /admin then spawn terraformer\n'
-                '  • Terraformer resets the biome while preserving all your structures\n\n'
-                'For easier testing:\n'
-                '  • Create a brand new world to hear your music immediately\n'
-                '  • Or delete world files and regenerate them\n\n'
-                'Your mod is ready to install!'
-            )
-            self._show_export_confirmation_dialog(mod_name)
 
     def _show_format_selection_dialog(self):
         """
@@ -4338,6 +5291,7 @@ QGroupBox {{
         This dialog appears RIGHT BEFORE generation so users can't accidentally skip it.
         """
         dialog = QDialog(self)
+        dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dialog.setWindowTitle('Choose Output Format')
         dialog.setModal(True)
         dialog.setMinimumWidth(450)
@@ -4397,12 +5351,34 @@ QGroupBox {{
         button_layout.addStretch()
         
         cancel_btn = QPushButton('Cancel')
-        cancel_btn.setStyleSheet('background-color: #3a4a6a; color: #e6ecff; border-radius: 6px; padding: 6px 16px; font-family: "Hobo";')
+        cancel_btn.setStyleSheet('''QPushButton {
+            background-color: #3a4a6a;
+            color: #e6ecff;
+            border-radius: 6px;
+            padding: 6px 16px;
+            font-family: "Hobo";
+        }
+        QPushButton:hover {
+            background-color: #4a6a9a;
+        }
+        ''')
         cancel_btn.clicked.connect(dialog.reject)
         button_layout.addWidget(cancel_btn)
         
         ok_btn = QPushButton('Continue with Generation')
-        ok_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; border-radius: 6px; padding: 6px 20px; font-family: "Hobo"; font-weight: bold;')
+        ok_btn.setStyleSheet('''QPushButton {
+            background-color: #3a6ea5;
+            color: #e6ecff;
+            border-radius: 6px;
+            padding: 6px 20px;
+            font-family: "Hobo";
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #4e8cff;
+            border: 1px solid #6bbcff;
+        }
+        ''')
         ok_btn.clicked.connect(dialog.accept)
         button_layout.addWidget(ok_btn)
         
@@ -4438,72 +5414,109 @@ QGroupBox {{
         
         reply = dialog.exec()
         if reply == QMessageBox.Yes:
-            self._export_and_install_mod(mod_name, use_pak)
+            self._launch_export_worker(mod_name, use_pak)
         else:
             self.audio_status_label.setText('⏸️  Mod ready in staging. Installation skipped.')
             self.logger.log('User cancelled mod installation')
-
-    def _export_and_install_mod(self, mod_name: str, use_pak: bool = True):
-        """Export completed mod to Starbound/mods/ folder"""
-        try:
-            self.audio_status_label.setText('⏳ Installing mod to Starbound...')
-            self.update()
-            
-            from utils.starbound_locator import find_starbound_folder
-            from utils.mod_exporter import export_mod_loose, export_mod_pak
-            
-            # Locate staging and Starbound
-            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
-            staging_dir = starsound_dir / 'staging'
-            safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-            staging_mod_path = staging_dir / safe_mod_name
-            
-            # Find Starbound installation
-            starbound_path = find_starbound_folder()
-            if not starbound_path:
-                self.audio_status_label.setText('❌ Could not find Starbound installation')
-                QMessageBox.warning(self, 'Starbound Not Found', 'Could not locate Starbound installation folder.')
-                self.logger.error('Starbound path not found')
-                return
-            
-            starbound_mods_path = Path(starbound_path) / 'mods'
-            starbound_mods_path.mkdir(parents=True, exist_ok=True)
-            
-            # Export based on format selection
-            if use_pak:
-                success, message, installed_path = export_mod_pak(
-                    staging_mod_path,
-                    starbound_mods_path,
-                    Path(starbound_path),
-                    logger=self.logger
-                )
-            else:
-                success, message, installed_path = export_mod_loose(
-                    staging_mod_path,
-                    starbound_mods_path,
-                    logger=self.logger
-                )
-            
-            if success:
-                self.audio_status_label.setText(f'✅ {message}')
-                self.logger.log(f'Mod installed successfully: {installed_path}')
-                
-                # Show success dialog with location
-                QMessageBox.information(
-                    self,
-                    'Mod Installed',
-                    f'{message}\n\nMod is now ready to use in Starbound!\n\nLocation: {installed_path}'
-                )
-            else:
-                self.audio_status_label.setText(f'❌ Installation failed: {message}')
-                self.logger.error(f'Mod installation failed: {message}')
-                QMessageBox.warning(self, 'Installation Failed', f'Could not install mod:\n{message}')
+    
+    def _launch_export_worker(self, mod_name, use_pak):
+        """Launch mod export in a background thread"""
+        from PyQt5.QtCore import QTimer
         
-        except Exception as e:
-            msg = f'Exception during mod installation: {str(e)}'
-            self.audio_status_label.setText(f'❌ {msg}')
-            self.logger.error(msg)
-            QMessageBox.critical(self, 'Installation Error', f'An error occurred:\n{str(e)}')
+        # Create and launch worker
+        self.export_worker = ExportWorker(self, mod_name, use_pak)
+        
+        # Create progress dialog
+        progress_dialog = QMessageBox(self)
+        progress_dialog.setWindowFlags(progress_dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        progress_dialog.setWindowTitle('📦 Installing Mod...')
+        progress_dialog.setText('Copying mod to Starbound/mods folder...\n(This window will close when done)')
+        progress_dialog.setStandardButtons(QMessageBox.NoButton)  # No buttons while working
+        progress_dialog.setFixedSize(600, 220)  # Fixed width AND height to prevent any resizing
+        
+        # Status label for updates
+        status_label = QLabel('Initializing...')
+        status_label.setWordWrap(True)
+        status_label.setFixedWidth(560)  # Keep label from expanding dialog
+        status_label.setMaximumHeight(40)  # Limit height so text wraps instead of expanding
+        
+        # Progress bar with cyan styling
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        progress_bar.setFixedHeight(25)
+        progress_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #00d4ff; background-color: #0d1117; border-radius: 4px; }"
+            "QProgressBar::chunk { background-color: #00d4ff; border-radius: 3px; }"
+        )
+        
+        layout = progress_dialog.layout()
+        layout.addWidget(progress_bar, 1, 1)
+        layout.addWidget(status_label, 2, 1)
+        
+        # Animated hourglass for visual feedback
+        hourglass_frames = ['⏳', '⌛']
+        hourglass_index = [0]
+        
+        def animate_hourglass():
+            hourglass_index[0] = (hourglass_index[0] + 1) % len(hourglass_frames)
+            current_frame = hourglass_frames[hourglass_index[0]]
+            progress_dialog.setText(f'{current_frame} Copying mod to Starbound/mods folder...\n(This window will close when done)')
+        
+        # Timer for hourglass animation
+        hourglass_timer = QTimer()
+        hourglass_timer.timeout.connect(animate_hourglass)
+        hourglass_timer.start(500)  # Animate every 500ms
+        
+        # Connect signals
+        self.export_worker.progress_update.connect(
+            lambda data: (
+                status_label.setText(data.get('message', '')),
+                progress_bar.setValue(data.get('percentage', 0))
+            )
+        )
+        self.export_worker.export_complete.connect(
+            lambda result: (
+                hourglass_timer.stop(),
+                self._on_export_complete(result, progress_dialog, mod_name)
+            )
+        )
+        
+        # Start worker
+        self.export_worker.start()
+        progress_dialog.exec_()
+    
+    def _on_export_complete(self, result, progress_dialog, mod_name):
+        """Handle mod export completion"""
+        # Close progress dialog
+        progress_dialog.accept()
+        
+        # Process results
+        success = result.get('success', False)
+        message = result.get('message', '')
+        installed_path = result.get('installed_path', '')
+        error_msg = result.get('error_msg', None)
+        
+        if error_msg:
+            self.audio_status_label.setText(f'❌ Installation failed: {error_msg}')
+            self.logger.error(f'Mod export error: {error_msg}')
+            QMessageBox.critical(self, 'Installation Error', f'Could not install mod:\n{error_msg}')
+            return
+        
+        if success:
+            self.audio_status_label.setText(f'✅ {message}')
+            self.logger.log(f'Mod installed successfully: {installed_path}')
+            
+            # Show success dialog with location
+            QMessageBox.information(
+                self,
+                'Mod Installed! ✅',
+                f'{message}\n\nMod is now ready to use in Starbound!\n\nLocation:\n{installed_path}'
+            )
+        else:
+            self.audio_status_label.setText(f'❌ Installation failed: {message}')
+            self.logger.error(f'Mod installation failed: {message}')
+            QMessageBox.warning(self, 'Installation Failed', f'Could not install mod:\n{message}')
 
     def _gather_current_mod_state(self) -> dict:
         """Gather current mod configuration into a saveable state dict"""
@@ -4532,7 +5545,7 @@ QGroupBox {{
                 success = self.mod_save_manager.save_mod(mod_name, mod_state)
                 if action:
                     if success:
-                        print(f'[PERSIST] [OK] Auto-saved mod on {action}: {mod_name}')
+                        print(f'[PERSIST] ✅ Auto-saved mod on {action}: {mod_name}')
                     else:
                         print(f'[PERSIST] [FAIL] FAILED to auto-save mod on {action}: {mod_name}')
         except Exception as e:
@@ -4588,6 +5601,11 @@ QGroupBox {{
             if 'add_selections' in config:
                 self.add_selections = config['add_selections']
                 print(f'[PERSIST] Restored add_selections for {len(self.add_selections)} biome(s)')
+                
+                # If add_selections has biomes but selected_biomes is empty, sync them
+                if self.add_selections and not self.selected_biomes:
+                    self.selected_biomes = list(self.add_selections.keys())
+                    print(f'[PERSIST] Synced selected_biomes from add_selections: {len(self.selected_biomes)} bimes')
             
             # Restore selected biomes and update display
             if 'selected_biomes' in config:
@@ -4615,7 +5633,21 @@ QGroupBox {{
                 
                 # Update biome display label if it exists
                 if hasattr(self, 'selected_biomes_label') and self.selected_biomes:
-                    self.selected_biomes_label.setText(f'🌍 Biomes: {", ".join([bio for cat, bio in self.selected_biomes])}')
+                    biome_display_list = [bio for cat, bio in self.selected_biomes]
+                    biome_count = len(biome_display_list)
+                    if biome_count <= 5:
+                        biome_display = ", ".join(biome_display_list)
+                    else:
+                        first_five = ", ".join(biome_display_list[:5])
+                        remaining = biome_count - 5
+                        biome_display = f'{first_five}, and {remaining} more'
+                    
+                    # Add track count to biome label
+                    track_count = len(self.day_tracks) + len(self.night_tracks) if (self.day_tracks or self.night_tracks) else 0
+                    if track_count > 0:
+                        self.selected_biomes_label.setText(f'✓ Biomes ({biome_count}): {biome_display} | {track_count} tracks')
+                    else:
+                        self.selected_biomes_label.setText(f'✓ Biomes ({biome_count}): {biome_display}')
                     print(f'[PERSIST] Updated selected_biomes_label')
             
             # Restore selected_track_type (Day/Night/Both choice)
@@ -4662,6 +5694,9 @@ QGroupBox {{
                     self.add_to_game_btn.hide()
                 if hasattr(self, 'replace_and_add_btn'):
                     self.replace_and_add_btn.hide()
+                # Show View All Tracks button for Replace mode
+                if hasattr(self, 'view_tracks_btn'):
+                    self.view_tracks_btn.show()
                 self.replace_was_selected = True  # Mark that Replace was selected
                 self._set_step6_visible(False)  # Hide Step 6
                 print(f'[PERSIST] Applied Replace mode button visibility')
@@ -4700,12 +5735,27 @@ QGroupBox {{
             traceback.print_exc()
 
     def clear_audio(self):
-        """Clear all selected audio files"""
-        self.selected_audio_files = []
-        self.selected_files_label.setText('')
-        print('[PERSIST] Audio files cleared')
-        self._auto_save_mod_state('audio clear')
-        self.logger.log('Audio files cleared')
+        """Clear all selected audio files with confirmation"""
+        if not hasattr(self, 'selected_audio_files') or not self.selected_audio_files:
+            return  # Nothing to clear
+        
+        file_count = len(self.selected_audio_files)
+        reply = QMessageBox.question(
+            self,
+            '🗑️ Clear Selected Files?',
+            f'Are you sure you want to remove all {file_count} selected file(s)?\n\nThis cannot be undone.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.selected_audio_files = []
+            self.selected_files_label.setText('')
+            self.files_needing_split.clear()
+            self.split_decisions.clear()
+            print('[PERSIST] Audio files cleared')
+            self._auto_save_mod_state('audio clear')
+            self.logger.log(f'Audio files cleared ({file_count} file(s) removed)')
 
     def on_new_mod(self):
         """Start a new mod configuration from scratch"""
@@ -4720,6 +5770,9 @@ QGroupBox {{
             
             if reply == QMessageBox.Cancel:
                 return
+            
+            # Set flag to prevent auto-loading old config when mod name is generated
+            self._skip_config_restore = True
             
             # Generate a new random name for the fresh mod
             from utils.random_mod_name import generate_random_mod_name
@@ -4853,6 +5906,7 @@ QGroupBox {{
             
             # Create selection dialog
             dlg = QDialog(self)
+            dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
             dlg.setWindowTitle('Load Mod Configuration')
             dlg.setMinimumSize(400, 300)
             dlg.setStyleSheet('background-color: #23283b; color: #e6ecff;')
@@ -4876,9 +5930,30 @@ QGroupBox {{
             # Buttons
             btn_layout = QHBoxLayout()
             load_btn = QPushButton('Load')
-            load_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; border-radius: 6px; border: 1px solid #4e8cff; padding: 6px;')
+            load_btn.setStyleSheet('''QPushButton {
+                background-color: #3a6ea5;
+                color: #e6ecff;
+                border-radius: 6px;
+                border: 1px solid #4e8cff;
+                padding: 6px;
+            }
+            QPushButton:hover {
+                background-color: #4e8cff;
+                border: 1px solid #6bbcff;
+            }
+            ''')
             cancel_btn = QPushButton('Cancel')
-            cancel_btn.setStyleSheet('background-color: #3a4a6a; color: #e6ecff; border-radius: 6px; border: 1px solid #555; padding: 6px;')
+            cancel_btn.setStyleSheet('''QPushButton {
+                background-color: #3a4a6a;
+                color: #e6ecff;
+                border-radius: 6px;
+                border: 1px solid #555;
+                padding: 6px;
+            }
+            QPushButton:hover {
+                background-color: #4a6a9a;
+            }
+            ''')
             btn_layout.addWidget(load_btn)
             btn_layout.addWidget(cancel_btn)
             layout.addLayout(btn_layout)
@@ -4899,17 +5974,36 @@ QGroupBox {{
             
             # Show dialog
             if dlg.exec_() == QDialog.Accepted and selected_filename[0]:
-                # FIRST: Clear all old UI state to prevent previous mod's data from showing
-                print(f'[LOAD_MOD] Clearing old state before loading new mod')
+                # FIRST: Completely reset all old UI state to prevent previous mod's data from showing
+                print(f'[LOAD_MOD] Clearing all old state before loading new mod')
                 self.day_tracks = []
                 self.night_tracks = []
-                self.add_selections = {}  # Clear per-biome Add selections (NEW)
+                self.add_selections = {}  # Clear per-biome Add selections
                 self.selected_track_type = None
                 self.replace_selections = {}
                 self.selected_biomes = []
-                self.patch_mode = 'add'
+                self.patch_mode = None  # Reset to None, will be set by loaded config
                 self._mode_confirmed_this_session = False
                 self.replace_was_selected = False
+                
+                # Reset ALL button visibility to initial state (all visible)
+                print(f'[LOAD_MOD] Resetting button visibility to initial state')
+                if hasattr(self, 'add_to_game_btn'):
+                    self.add_to_game_btn.show()
+                if hasattr(self, 'replace_btn'):
+                    self.replace_btn.show()
+                if hasattr(self, 'replace_and_add_btn'):
+                    self.replace_and_add_btn.show()
+                if hasattr(self, 'view_tracks_btn'):
+                    self.view_tracks_btn.show()
+                
+                # Reset UI labels and display elements
+                if hasattr(self, 'audio_status_label'):
+                    self.audio_status_label.setText('Select a patching method above')
+                if hasattr(self, 'selected_biomes_label'):
+                    self.selected_biomes_label.setText('No biomes selected yet.')
+                self.update_selected_tracks_label()  # Reset track display
+                self._set_step6_visible(False)  # Hide Step 6 initially
                 
                 # THEN: Load the mod
                 config = self.mod_save_manager.load_mod(selected_filename[0])
@@ -4918,13 +6012,20 @@ QGroupBox {{
                     # After loading mod, validate backup folders
                     if 'mod_name' in config:
                         mod_name_to_validate = config['mod_name']
+                        
+                        # 🆕 CRITICAL: Save the loaded mod name to settings so it persists on app restart
+                        self.settings.set('last_mod_name', mod_name_to_validate)
+                        print(f'[LOAD_MOD] Saved loaded mod to settings: {mod_name_to_validate}')
+                        
                         try:
                             starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
                             staging_dir = starsound_dir / 'staging'
                             safe_mod_name = "".join(c for c in mod_name_to_validate if c.isalnum() or c in (' ', '_', '-')).rstrip()
                             
-                            backups_originals = staging_dir / safe_mod_name / 'backups' / 'originals'
-                            backups_converted = staging_dir / safe_mod_name / 'backups' / 'converted'
+                            # Backups are at root-level backups/
+                            backup_root = self._get_backup_path(mod_name_to_validate)
+                            backups_originals = backup_root / 'originals'
+                            backups_converted = backup_root / 'converted'
                             
                             if backups_originals.exists():
                                 # Move any .ogg files from originals to converted
@@ -4942,26 +6043,109 @@ QGroupBox {{
                     if 'mod_name' in config:
                         self.modname_input.setText(config['mod_name'])
                     
+                    # 🆕 Restore add_selections (per-biome Add mode selections)
+                    if 'add_selections' in config:
+                        self.add_selections = config['add_selections']
+                        print(f'[LOAD_MOD] Restored add_selections for {len(self.add_selections)} biome(s)')
+                    
+                    # 🆕 Restore replace_selections (per-biome Replace mode selections)
+                    if 'replace_selections' in config:
+                        self.replace_selections = config['replace_selections']
+                        print(f'[LOAD_MOD] Restored replace_selections for {len(self.replace_selections)} biome(s)')
+                    
                     if 'patch_mode' in config:
                         mode = config['patch_mode']
                         self.patch_mode = mode
+                        print(f'[LOAD_MOD] Loaded patch_mode from config: {mode}')
                         # Mark as confirmed since we're loading a saved mod (was confirmed in previous session)
                         self._mode_confirmed_this_session = True
                         self.settings.set('last_patch_mode', mode)
                         
-                        # Update UI based on mode
+                        # Update UI based on mode - set button visibility to match the mode's lock state
                         if mode == 'add':
-                            self.audio_status_label.setText('✅ Mode: Add to Game (your music added alongside vanilla tracks)')
-                            self.replace_btn.show()
-                            self.replace_and_add_btn.show()
+                            print(f'[LOAD_MOD] Setting button visibility for ADD mode')
+                            self.audio_status_label.setText('✅ Mode: Add to Game (⭐ Check "Remove vanilla" for safest option, or add alongside vanilla)')
+                            # Add mode: hide Replace and Both buttons, keep Add visible
+                            self.replace_btn.hide()
+                            self.replace_and_add_btn.hide()
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.show()
+                            self._set_step6_visible(True)  # Show Step 6 with Day/Night buttons
                         elif mode == 'replace':
+                            print(f'[LOAD_MOD] Setting button visibility for REPLACE mode')
                             self.audio_status_label.setText('🎵 Mode: Replace Base Game Music (one track at a time)')
-                            self.replace_btn.hide()
+                            # Replace mode: hide Add and Both buttons, keep Replace visible
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.hide()
                             self.replace_and_add_btn.hide()
+                            self.replace_btn.show()
+                            # Show View All Tracks button for Replace mode
+                            if hasattr(self, 'view_tracks_btn'):
+                                self.view_tracks_btn.show()
+                            self.replace_was_selected = True  # Lock in mode for this session
+                            self._set_step6_visible(False)
                         elif mode == 'both':
-                            self.audio_status_label.setText('🔄 Mode: Replace + Add (remove vanilla, then add your music)')
+                            print(f'[LOAD_MOD] Setting button visibility for BOTH mode')
+                            print(f'[LOAD_MOD] Both mode data: replace_selections={len(self.replace_selections)}, add_selections={len(self.add_selections)}, selected_biomes={len(self.selected_biomes)}')
+                            self.audio_status_label.setText('🔄 Mode: Replace specific tracks + Add new music')
+                            # Both mode: hide Add and Replace buttons, keep Both visible
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.hide()
+                            self.replace_btn.hide()
+                            self.replace_and_add_btn.show()
+                            self.replace_was_selected = True  # Lock in mode for this session
+                            self._set_step6_visible(True)  # Show Step 6 for Add selections
+                            print(f'[LOAD_MOD] Both mode complete - Step 6 visible, buttons hidden, ready for use')
+                    else:
+                        # patch_mode not saved - infer from selections (for old mods)
+                        has_replace = bool(config.get('replace_selections', {}))
+                        has_add = bool(config.get('add_selections', {}))
+                        
+                        if has_replace and has_add:
+                            inferred_mode = 'both'
+                        elif has_replace:
+                            inferred_mode = 'replace'
+                        else:
+                            inferred_mode = 'add'
+                        
+                        self.patch_mode = inferred_mode
+                        print(f'[LOAD_MOD] No patch_mode in config, inferred: {inferred_mode} (replace={has_replace}, add={has_add})')
+                        self.logger.log(f'[LOAD_MOD] No patch_mode in config, inferred from selections: {inferred_mode} (replace={has_replace}, add={has_add})')
+                        # Update UI to match - set button visibility to match the inferred mode's lock state
+                        if inferred_mode == 'add':
+                            print(f'[LOAD_MOD] Setting button visibility for INFERRED ADD mode')
+                            self.audio_status_label.setText('✅ Mode: Add to Game (⭐ Check "Remove vanilla" for safest option, or add alongside vanilla)')
+                            # Add mode: hide Replace and Both buttons, keep Add visible
                             self.replace_btn.hide()
                             self.replace_and_add_btn.hide()
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.show()
+                            self._set_step6_visible(True)  # Show Step 6 with Day/Night buttons
+                        elif inferred_mode == 'replace':
+                            print(f'[LOAD_MOD] Setting button visibility for INFERRED REPLACE mode')
+                            self.audio_status_label.setText('🎵 Mode: Replace Base Game Music (one track at a time)')
+                            # Replace mode: hide Add and Both buttons, keep Replace visible
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.hide()
+                            self.replace_and_add_btn.hide()
+                            self.replace_btn.show()
+                            # Show View All Tracks button for Replace mode
+                            if hasattr(self, 'view_tracks_btn'):
+                                self.view_tracks_btn.show()
+                            self.replace_was_selected = True  # Lock in mode for this session
+                            self._set_step6_visible(False)
+                        elif inferred_mode == 'both':
+                            print(f'[LOAD_MOD] Setting button visibility for INFERRED BOTH mode')
+                            print(f'[LOAD_MOD] Both mode data: replace_selections={len(self.replace_selections)}, add_selections={len(self.add_selections)}, selected_biomes={len(self.selected_biomes)}')
+                            self.audio_status_label.setText('🔄 Mode: Replace specific tracks + Add new music')
+                            # Both mode: hide Add and Replace buttons, keep Both visible
+                            if hasattr(self, 'add_to_game_btn'):
+                                self.add_to_game_btn.hide()
+                            self.replace_btn.hide()
+                            self.replace_and_add_btn.show()
+                            self.replace_was_selected = True  # Lock in mode for this session
+                            self._set_step6_visible(True)  # Show Step 6 for Add selections
+                            print(f'[LOAD_MOD] Inferred Both mode complete - Step 6 visible, buttons hidden')
                     
                     if 'day_tracks' in config:
                         self.day_tracks = config['day_tracks']
@@ -4979,11 +6163,26 @@ QGroupBox {{
                     self.update_selected_tracks_label()
                     if hasattr(self, 'selected_biomes_label'):
                         if self.selected_biomes:
-                            biome_names = ", ".join([bio for cat, bio in self.selected_biomes])
-                            self.selected_biomes_label.setText(f'✅ Selected: {biome_names}')
+                            biome_display_list = [bio for cat, bio in self.selected_biomes]
+                            biome_count = len(biome_display_list)
+                            if biome_count <= 5:
+                                biome_display = ", ".join(biome_display_list)
+                            else:
+                                first_five = ", ".join(biome_display_list[:5])
+                                remaining = biome_count - 5
+                                biome_display = f'{first_five}, and {remaining} more'
+                            # Add track count to biome label
+                            track_count = len(self.day_tracks) + len(self.night_tracks) if (self.day_tracks or self.night_tracks) else 0
+                            if track_count > 0:
+                                self.selected_biomes_label.setText(f'✓ Biomes ({biome_count}): {biome_display} | {track_count} tracks')
+                            else:
+                                self.selected_biomes_label.setText(f'✓ Biomes ({biome_count}): {biome_display}')
                         else:
                             self.selected_biomes_label.setText('No biomes selected yet.')
                     self.update_patch_btn_state()
+                    
+                    # Force complete UI refresh to ensure all state updates are visible
+                    self.update()  # Repaint the window
                     
                     QMessageBox.information(self, 'Mod Loaded', 'Mod configuration loaded successfully.')
                     self.logger.log(f'Loaded mod configuration: {config.get("mod_name", "Unknown")}')
@@ -5026,6 +6225,11 @@ QGroupBox {{
             mod_name = self.modname_input.text().strip() if hasattr(self, 'modname_input') else ''
             # Only save if user has explicitly set a mod name
             if mod_name and mod_name != 'blank_mod':
+                # 🆕 CRITICAL: Ensure the mod name is saved to settings before closing
+                # This prevents the last_mod_name from being blank on next startup
+                self.settings.set('last_mod_name', mod_name)
+                self.logger.log(f'Saved last_mod_name to settings before close: {mod_name}')
+                
                 mod_state = self._gather_current_mod_state()
                 self.mod_save_manager.save_mod(mod_name, mod_state)
                 self.logger.log(f'Mod saved on window close: {mod_name}')
@@ -5035,11 +6239,96 @@ QGroupBox {{
         # Allow the window to close normally
         event.accept()
 
+
+# SearchFilterWorker - background thread for fast track searching
+class SearchFilterWorker(QThread):
+    """Background worker for filtering tracks - keeps UI responsive during search"""
+    filter_complete = pyqtSignal(list, int)  # Emits (filtered_data, total_count)
+    
+    def __init__(self, search_index, query):
+        super().__init__()
+        self.search_index = search_index  # Lightweight index of all tracks
+        self.query = query.lower().strip()  # Search query
+    
+    def run(self):
+        """Execute search in background thread"""
+        try:
+            if not self.query:
+                # No search - return all data
+                filtered_data = []
+                total_count = 0
+                # This shouldn't happen (called from UI), but handle it
+                self.filter_complete.emit([], 0)
+                return
+            
+            # Fast search through lightweight index
+            filtered_data = []
+            total_count = sum(len(entry['tracks']) for entry in self.search_index)
+            
+            for index_entry in self.search_index:
+                biome = index_entry['biome']
+                biome_text = index_entry['biome_text']
+                
+                # Check if biome matches
+                biome_matches = self.query in biome_text
+                
+                # Collect matching tracks
+                day_dict = {}
+                night_dict = {}
+                day_list = []
+                night_list = []
+                is_replace = None
+                
+                for track_name, track_path, is_day, is_replace_mode, key_idx in index_entry['tracks']:
+                    # Track matches if biome matches OR track name matches
+                    if biome_matches or self.query in track_name:
+                        is_replace = is_replace_mode
+                        
+                        if is_replace_mode:
+                            # Replace mode: store as dict with index
+                            if is_day:
+                                day_dict[key_idx] = track_path
+                            else:
+                                night_dict[key_idx] = track_path
+                        else:
+                            # Add mode: store as list
+                            if is_day:
+                                day_list.append(track_path)
+                            else:
+                                night_list.append(track_path)
+                
+                # Only include biome if it has matching tracks
+                if day_dict or night_dict or day_list or night_list:
+                    filtered_data.append({
+                        'biome': biome,
+                        'day': day_dict if is_replace else day_list,
+                        'night': night_dict if is_replace else night_list,
+                        'is_replace': is_replace
+                    })
+            
+            # Calculate total visible (only matching tracks)
+            total_visible = sum(
+                len(d['day']) + len(d['night']) 
+                for d in filtered_data
+            )
+            
+            # Emit results
+            self.filter_complete.emit(filtered_data, total_count)
+        
+        except Exception as e:
+            print(f'[SEARCH_ERROR] Error in search filter: {e}')
+            import traceback
+            traceback.print_exc()
+
+
 class TracksViewerWindow(QDialog):
     """Separate window for viewing and managing selected tracks"""
+    search_filter_complete = pyqtSignal(list, int)  # (filtered_data, total_count)
     
     def __init__(self, parent, main_window):
         super().__init__(parent)
+        # Explicitly disable Windows help button on this dialog
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.main_window = main_window
         self.setWindowTitle('Selected Tracks - Full View')
         self.setMinimumSize(600, 500)
@@ -5057,10 +6346,89 @@ class TracksViewerWindow(QDialog):
         title.setStyleSheet('color: #00d4ff; font-weight: bold; font-size: 14px; margin-bottom: 8px;')
         layout.addWidget(title)
         
+        # 🆕 SEARCH BAR
+        search_layout = QHBoxLayout()
+        search_label = QLabel('🔍 Search:')
+        search_label.setStyleSheet('color: #b19cd9; font-size: 11px;')
+        search_layout.addWidget(search_label)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText('Type track name or biome to filter...')
+        self.search_input.setStyleSheet('''QLineEdit {
+            background-color: #283046;
+            color: #e6ecff;
+            border: 1px solid #3a4a6a;
+            border-radius: 4px;
+            padding: 4px;
+            font-size: 11px;
+        }
+        QLineEdit:focus {
+            border: 1px solid #6bbcff;
+            background-color: #2d3a4a;
+        }''')
+        self.search_input.textChanged.connect(self._on_search_changed)
+        self.search_input.returnPressed.connect(lambda: None)  # Prevent Enter from doing anything
+        search_layout.addWidget(self.search_input, 1)
+        
+        # Track count display
+        self.count_label = QLabel('(0 / 0)')
+        self.count_label.setStyleSheet('color: #b19cd9; font-size: 10px; min-width: 60px;')
+        search_layout.addWidget(self.count_label)
+        
+        # Clear search button (X)
+        self.clear_search_btn = QPushButton('✕')
+        self.clear_search_btn.setMaximumWidth(28)
+        self.clear_search_btn.setStyleSheet('''QPushButton {
+            background-color: #3a4a6a;
+            color: #ff6b6b;
+            border: 1px solid #3a4a6a;
+            border-radius: 3px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #4a5a7a;
+        }
+        QPushButton:pressed {
+            background-color: #2a3a5a;
+        }''')
+        self.clear_search_btn.clicked.connect(self._clear_search)
+        search_layout.addWidget(self.clear_search_btn)
+        
+        layout.addLayout(search_layout)
+        
         # Scrollable content area
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet('border: 1px solid #3a4a6a; border-radius: 4px; background: #0a0e27;')
+        self.scroll_area.setStyleSheet('''
+            QScrollArea {
+                border: 1px solid #3a4a6a;
+                border-radius: 4px;
+                background: #0a0e27;
+            }
+            QScrollBar:vertical {
+                background-color: #1a2540;
+                width: 16px;
+                border-radius: 8px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4a6a9a;
+                border-radius: 8px;
+                min-height: 60px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #6a8aba;
+            }
+            QScrollBar::add-line:vertical {
+                border: none;
+                background: none;
+            }
+            QScrollBar::sub-line:vertical {
+                border: none;
+                background: none;
+            }
+        ''')
         
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
@@ -5070,24 +6438,147 @@ class TracksViewerWindow(QDialog):
         
         layout.addWidget(self.scroll_area)
         
+        # Store search query and full track data for filtering
+        self.current_search = ''
+        self.all_track_data = []  # Will store: (biome, type, tracks_dict, is_replace_mode)
+        self.search_index = []  # Lightweight index: [{'biome': tuple, 'biome_text': str, 'tracks': [(name, path, is_day, is_replace), ...]}, ...]
+        self.search_worker = None  # Background worker thread for filtering
+        self.search_filter_complete = pyqtSignal(list, int)
+        
+        # Debounce timer - wait 800ms after user stops typing before searching
+        self.search_debounce_timer = QTimer()
+        self.search_debounce_timer.setSingleShot(True)
+        self.search_debounce_timer.timeout.connect(self._perform_search)
+        self.search_debounce_timer.setInterval(800)  # 800ms delay - gives user time to type
+        
+        # Track which search is "current" - prevents stale results from displaying
+        self.current_search_id = 0  # Incremented when search is cleared
+        
         # Refresh and close buttons
         button_layout = QHBoxLayout()
         refresh_btn = QPushButton('🔄 Refresh')
-        refresh_btn.setStyleSheet('background-color: #3a6ea5; color: #e6ecff; padding: 6px 12px; border-radius: 4px;')
+        refresh_btn.setStyleSheet('''QPushButton {
+            background-color: #3a6ea5;
+            color: #e6ecff;
+            padding: 6px 12px;
+            border-radius: 4px;
+        }
+        QPushButton:hover {
+            background-color: #4e8cff;
+        }
+        ''')
         refresh_btn.clicked.connect(self._on_refresh_clicked)
         button_layout.addWidget(refresh_btn)
         button_layout.addStretch()
         
         close_btn = QPushButton('Close')
-        close_btn.setStyleSheet('background-color: #2d5a3d; color: #e6ecff; padding: 6px 12px; border-radius: 4px;')
+        close_btn.setStyleSheet('''QPushButton {
+            background-color: #2d5a3d;
+            color: #e6ecff;
+            padding: 6px 12px;
+            border-radius: 4px;
+        }
+        QPushButton:hover {
+            background-color: #3a8a55;
+        }
+        ''')
         close_btn.clicked.connect(self.accept)
         button_layout.addWidget(close_btn)
         
         layout.addLayout(button_layout)
     
+    def _on_search_changed(self, search_text):
+        """Search text changed - only search on new typed text, ignore backspace"""
+        new_search = search_text.lower().strip()
+        
+        # Check if search is getting shorter (backspacing) or longer (typing)
+        is_getting_shorter = len(new_search) < len(self.current_search)
+        self.current_search = new_search
+        
+        # If search is now EMPTY, show all tracks in simplified view (instant!)
+        if not self.current_search:
+            self.search_debounce_timer.stop()
+            self.current_search_id += 1  # Invalidate any pending search results
+            # Kill any running search worker
+            if self.search_worker and self.search_worker.isRunning():
+                self.search_worker.requestInterruption()
+            
+            # Process any pending events to ensure old widgets are fully deleted
+            from PyQt5.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+            
+            # Clear search - restore full original window with all controls (deferred to avoid visual artifacts)
+            QTimer.singleShot(400, self.refresh_display)
+            return
+        
+        # If backspacing: do nothing! Leave current filtered results visible
+        if is_getting_shorter:
+            self.search_debounce_timer.stop()
+            return
+        
+        # If typing new letters: debounce and search
+        self.search_debounce_timer.stop()
+        self.search_debounce_timer.start()
+    
+    def _clear_search(self):
+        """Clear search button clicked - clear the search field"""
+        self.search_input.clear()
+    
+    def keyPressEvent(self, event):
+        """Override key press to prevent Enter from closing dialog"""
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            # If search input has focus, don't let Enter propagate
+            if self.search_input.hasFocus():
+                return
+        # Let other keys through to parent
+        super().keyPressEvent(event)
+    
+    def _perform_search(self):
+        """Actually perform the search after debounce delay (runs in main thread)"""
+        # Skip if no search query
+        if not self.current_search:
+            return
+        
+        # Capture current search ID so we can ignore stale results
+        search_id = self.current_search_id
+        
+        # Kill previous worker if still running
+        if self.search_worker and self.search_worker.isRunning():
+            self.search_worker.requestInterruption()
+        
+        # Spawn new worker thread for filtering
+        self.search_worker = SearchFilterWorker(self.search_index, self.current_search)
+        # Pass search_id so we can validate results are still current
+        self.search_worker.filter_complete.connect(lambda data, count: self._on_search_complete(data, count, search_id))
+        self.search_worker.start()
+    
+    def _on_search_complete(self, filtered_data, total_count, search_id):
+        """Slot called when search worker completes - only display if result is still current"""
+        # Ignore stale results from old searches (e.g., if user cleared the search)
+        if search_id != self.current_search_id:
+            return
+        
+        self._display_filtered_results(filtered_data, total_count)
+    
     def _on_refresh_clicked(self):
-        """Refresh button clicked - show feedback and update display"""
+        """Refresh button clicked - rebuild display (deferred to keep UI responsive)"""
+        # Show immediate feedback
+        self.count_label.setText('(refreshing...)')
+        self.count_label.setStyleSheet('color: #FFD700; font-size: 10px; min-width: 60px; font-weight: bold;')
+        
+        # Defer the heavy rebuild so UI can respond immediately
+        QTimer.singleShot(50, self._do_refresh_display_deferred)
+    
+    def _do_refresh_display_deferred(self):
+        """Actually rebuild display after UI has processed events"""
         self.refresh_display()
+        
+        # Update count label to show actual track count
+        if self.all_track_data:
+            total_count = sum(len(b['day']) + len(b['night']) for b in self.all_track_data)
+            self.count_label.setText(f'({total_count} / {total_count})')
+            self.count_label.setStyleSheet('color: #b19cd9; font-size: 10px; min-width: 60px;')
+        
         QMessageBox.information(self, 'Refreshed', '✓ Display updated')
     
     def _remove_track_and_refresh(self, biome, track_type, track_path):
@@ -5096,6 +6587,18 @@ class TracksViewerWindow(QDialog):
         self.main_window.remove_biome_track(biome, track_type, track_path)
         print(f'[TRACKS_VIEWER] Refreshing display after removal')
         self.refresh_display()
+        QMessageBox.information(self, 'Track Removed', f'✓ Removed from {biome[1]}')
+    
+    def _remove_track_from_search_and_refresh(self, biome, track_type, track_path):
+        """Remove a track from search results and refresh the search display"""
+        print(f'[TRACKS_VIEWER] Removing {track_type} track from search: {track_path}')
+        self.main_window.remove_biome_track(biome, track_type, track_path)
+        print(f'[TRACKS_VIEWER] Re-running search after removal')
+        # Re-run the current search to update filtered results
+        if self.current_search:
+            self._run_search(self.current_search)
+        else:
+            self._display_filtered_results(self.all_track_data, len(self._get_all_tracks()))
         QMessageBox.information(self, 'Track Removed', f'✓ Removed from {biome[1]}')
     
     def _clear_biome_and_refresh(self, biome, track_type):
@@ -5109,17 +6612,63 @@ class TracksViewerWindow(QDialog):
     def _remove_biome_and_refresh(self, biome):
         """Remove biome from selected_biomes and refresh"""
         print(f'[TRACKS_VIEWER] Removing biome from selection: {biome}')
+        removed_from_selections = False
+        removed_from_add_selections = False
+        
         if biome in self.main_window.selected_biomes:
             self.main_window.selected_biomes.remove(biome)
-            # Also clean up add_selections for this biome
-            if biome in self.main_window.add_selections:
-                del self.main_window.add_selections[biome]
-            self.main_window._auto_save_mod_state(f'Removed biome {biome[1]}')
-            self.main_window.update_selected_tracks_label()
-            self.main_window.update_patch_btn_state()
-            print(f'[TRACKS_VIEWER] Biome removed, refreshing display')
-            self.refresh_display()
-            QMessageBox.information(self, 'Biome Removed', f'✓ {biome[1]} removed from selection')
+            removed_from_selections = True
+            print(f'[TRACKS_VIEWER] Removed from selected_biomes: {biome}')
+        
+        # Also clean up add_selections for this biome
+        if biome in self.main_window.add_selections:
+            del self.main_window.add_selections[biome]
+            removed_from_add_selections = True
+            print(f'[TRACKS_VIEWER] Removed from add_selections: {biome}')
+        
+        print(f'[TRACKS_VIEWER] Removal summary - selected_biomes: {removed_from_selections}, add_selections: {removed_from_add_selections}')
+        
+        self.main_window._auto_save_mod_state(f'Removed biome {biome[1]}')
+        self.main_window.update_selected_tracks_label()
+        self.main_window.update_patch_btn_state()
+        print(f'[TRACKS_VIEWER] Biome removed, refreshing display')
+        self.refresh_display()
+        QMessageBox.information(self, 'Biome Removed', f'✓ {biome[1]} removed from selection')
+    
+    def _remove_replace_biome_and_refresh(self, biome):
+        """Remove biome from replace_selections and refresh"""
+        print(f'[TRACKS_VIEWER] Removing biome from replace_selections: {biome}')
+        if biome in self.main_window.replace_selections:
+            del self.main_window.replace_selections[biome]
+            print(f'[TRACKS_VIEWER] Removed from replace_selections: {biome}')
+        
+        self.main_window._auto_save_mod_state(f'Removed biome {biome[1]} from Replace')
+        self.main_window.update_selected_tracks_label()
+        self.main_window.update_patch_btn_state()
+        print(f'[TRACKS_VIEWER] Biome removed from replace, refreshing display')
+        self.refresh_display()
+        QMessageBox.information(self, 'Biome Removed', f'✓ {biome[1]} removed from Replace selection')
+    
+    def _remove_replace_track_and_refresh(self, biome, track_type, track_idx):
+        """Remove a specific replacement track (by index) and refresh display"""
+        print(f'[TRACKS_VIEWER] Removing {track_type} replacement track at index {track_idx}')
+        if biome in self.main_window.replace_selections:
+            biome_data = self.main_window.replace_selections[biome]
+            if track_type in biome_data and track_idx in biome_data[track_type]:
+                del biome_data[track_type][track_idx]
+                print(f'[TRACKS_VIEWER] Removed {track_type} replacement at index {track_idx}')
+                
+                # If both day and night are empty, remove the entire biome
+                if not biome_data.get('day') and not biome_data.get('night'):
+                    del self.main_window.replace_selections[biome]
+                    print(f'[TRACKS_VIEWER] Biome now empty, removing entirely from replace_selections')
+        
+        self.main_window._auto_save_mod_state(f'Removed replacement track from {biome[1]}')
+        self.main_window.update_selected_tracks_label()
+        self.main_window.update_patch_btn_state()
+        print(f'[TRACKS_VIEWER] Refreshing display after track removal')
+        self.refresh_display()
+        QMessageBox.information(self, 'Track Removed', f'✓ Removed from {biome[1]} Replace')
     
     def _on_cancel_remove_vanilla(self):
         """Cancel the 'Remove vanilla tracks' setting and refresh display"""
@@ -5130,23 +6679,315 @@ class TracksViewerWindow(QDialog):
             self.main_window.remove_vanilla_checkbox.setChecked(False)
         self.main_window._auto_save_mod_state('Cancelled Remove Vanilla Tracks from View All Tracks')
         self.refresh_display()
+    
+    def _display_add_tracks_section(self):
+        """Display the 'NEW TRACKS WILL BE ADDED' section with all buttons and controls (shared by Both mode and Add mode)"""
+        from PyQt5.QtCore import QCoreApplication
+        
+        add_selections = getattr(self.main_window, 'add_selections', {})
+        
+        # Add header
+        add_header = QLabel('➕ NEW TRACKS WILL BE ADDED')
+        add_header.setStyleSheet('color: #99ff99; font-weight: bold; font-size: 13px; margin-bottom: 4px; margin-top: 8px;')
+        self.content_layout.addWidget(add_header)
+        
+        if not add_selections:
+            empty_label = QLabel('No tracks selected yet.')
+            empty_label.setStyleSheet('color: #b19cd9; font-style: italic; font-size: 11px;')
+            empty_label.setAlignment(Qt.AlignCenter)
+            self.content_layout.addWidget(empty_label)
+        else:
+            total_tracks = 0
+            print(f'[TRACKS_VIEWER] Building Add display for {len(add_selections)} biome(s)')
+            
+            for (category, biome_name) in sorted(add_selections.keys()):
+                biome_data = add_selections[(category, biome_name)]
+                day_tracks = biome_data.get('day', [])
+                night_tracks = biome_data.get('night', [])
+                
+                biome_count = len(day_tracks) + len(night_tracks)
+                
+                print(f'[TRACKS_VIEWER] Add: {category}/{biome_name}: {len(day_tracks)} day, {len(night_tracks)} night')
+                
+                # Biome header with count and remove button
+                biome_header = QHBoxLayout()
+                biome_label = QLabel(f'📍 {category.upper()}: {biome_name}')
+                biome_label.setStyleSheet('color: #00d4ff; font-weight: bold; font-size: 12px;')
+                biome_header.addWidget(biome_label)
+                
+                count_label = QLabel(f'({biome_count} track{"" if biome_count == 1 else "s"})')
+                count_label.setStyleSheet('color: #b19cd9; font-size: 10px;')
+                biome_header.addWidget(count_label)
+                biome_header.addStretch()
+                
+                # Add remove biome button
+                remove_biome_btn = QPushButton('✕ Remove')
+                remove_biome_btn.setFixedWidth(80)
+                remove_biome_btn.setStyleSheet('''QPushButton {
+                    background-color: #8b3a3a;
+                    color: white;
+                    font-size: 9px;
+                    padding: 2px;
+                    border-radius: 3px;
+                    border: 1px solid #a04a4a;
+                }
+                QPushButton:hover {
+                    background-color: #a04a4a;
+                    border: 1px solid #c05a5a;
+                }''')
+                remove_biome_btn.setToolTip(f'Remove {biome_name} from selection')
+                remove_biome_btn.clicked.connect(partial(self._remove_biome_and_refresh, (category, biome_name)))
+                biome_header.addWidget(remove_biome_btn)
+                
+                self.content_layout.addLayout(biome_header)
+                
+                # If empty, show message
+                if biome_count == 0:
+                    empty_msg = QLabel('    (no tracks selected yet)')
+                    empty_msg.setStyleSheet('color: #666; font-size: 9px; font-style: italic;')
+                    self.content_layout.addWidget(empty_msg)
+                else:
+                    # Day tracks
+                    if day_tracks:
+                        print(f'[TRACKS_VIEWER] Adding {len(day_tracks)} day tracks')
+                        day_section = QVBoxLayout()
+                        day_title = QHBoxLayout()
+                        day_label = QLabel(f'  🌅 Day ({len(day_tracks)})')
+                        day_label.setStyleSheet('color: #FFD700; font-weight: bold; font-size: 11px;')
+                        day_title.addWidget(day_label)
+                        day_title.addStretch()
+                        
+                        clear_btn = QPushButton('Clear All')
+                        clear_btn.setFixedWidth(70)
+                        clear_btn.setStyleSheet('background-color: #c41e3a; color: white; font-size: 9px; padding: 3px; border-radius: 3px;')
+                        clear_btn.clicked.connect(partial(self._clear_biome_and_refresh, (category, biome_name), 'day'))
+                        day_title.addWidget(clear_btn)
+                        day_section.addLayout(day_title)
+                        
+                        for idx, track_path in enumerate(day_tracks):
+                            track_item = QHBoxLayout()
+                            track_name = Path(track_path).name
+                            track_label = QLabel(f'    • {track_name}')
+                            track_label.setStyleSheet('color: #e6ecff; font-size: 10px;')
+                            track_item.addWidget(track_label)
+                            track_item.addStretch()
+                            
+                            delete_btn = QPushButton('✕')
+                            delete_btn.setFixedSize(20, 20)
+                            delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
+                            delete_btn.setToolTip(f'Remove {track_name}')
+                            delete_btn.clicked.connect(partial(self._remove_track_and_refresh, (category, biome_name), 'day', track_path))
+                            track_item.addWidget(delete_btn)
+                            day_section.addLayout(track_item)
+                            
+                            # Allow UI to respond every 15 widgets
+                            if (idx + 1) % 15 == 0:
+                                QCoreApplication.processEvents()
+                        
+                        self.content_layout.addLayout(day_section)
+                    
+                    # Night tracks
+                    if night_tracks:
+                        print(f'[TRACKS_VIEWER] Adding {len(night_tracks)} night tracks')
+                        night_section = QVBoxLayout()
+                        night_title = QHBoxLayout()
+                        night_label = QLabel(f'  🌙 Night ({len(night_tracks)})')
+                        night_label.setStyleSheet('color: #87CEEB; font-weight: bold; font-size: 11px;')
+                        night_title.addWidget(night_label)
+                        night_title.addStretch()
+                        
+                        clear_btn = QPushButton('Clear All')
+                        clear_btn.setFixedWidth(70)
+                        clear_btn.setStyleSheet('background-color: #c41e3a; color: white; font-size: 9px; padding: 3px; border-radius: 3px;')
+                        clear_btn.clicked.connect(partial(self._clear_biome_and_refresh, (category, biome_name), 'night'))
+                        night_title.addWidget(clear_btn)
+                        night_section.addLayout(night_title)
+                        
+                        for idx, track_path in enumerate(night_tracks):
+                            track_item = QHBoxLayout()
+                            track_name = Path(track_path).name
+                            track_label = QLabel(f'    • {track_name}')
+                            track_label.setStyleSheet('color: #e6ecff; font-size: 10px;')
+                            track_item.addWidget(track_label)
+                            track_item.addStretch()
+                            
+                            delete_btn = QPushButton('✕')
+                            delete_btn.setFixedSize(20, 20)
+                            delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
+                            delete_btn.setToolTip(f'Remove {track_name}')
+                            delete_btn.clicked.connect(partial(self._remove_track_and_refresh, (category, biome_name), 'night', track_path))
+                            track_item.addWidget(delete_btn)
+                            night_section.addLayout(track_item)
+                            
+                            # Allow UI to respond every 15 widgets
+                            if (idx + 1) % 15 == 0:
+                                QCoreApplication.processEvents()
+                        
+                        self.content_layout.addLayout(night_section)
+                
+                self.content_layout.addSpacing(6)
+    
+    def _display_replace_tracks_section(self):
+        """Display the 'TRACKS TO REPLACE' section with vanilla → custom mapping and remove buttons (shared by Both mode and Replace mode)"""
+        from utils.patch_generator import get_vanilla_tracks_for_biome
+        
+        replace_selections = getattr(self.main_window, 'replace_selections', {})
+        
+        # Add header
+        replace_header = QLabel('🔄 TRACKS TO REPLACE')
+        replace_header.setStyleSheet('color: #ff9999; font-weight: bold; font-size: 13px; margin-bottom: 4px; margin-top: 8px;')
+        self.content_layout.addWidget(replace_header)
+        
+        if not replace_selections:
+            empty_label = QLabel('No tracks to replace.')
+            empty_label.setStyleSheet('color: #b19cd9; font-style: italic; font-size: 11px;')
+            empty_label.setAlignment(Qt.AlignCenter)
+            self.content_layout.addWidget(empty_label)
+        else:
+            print(f'[TRACKS_VIEWER] Building Replace display for {len(replace_selections)} biome(s)')
+            
+            for (category, biome_name) in sorted(replace_selections.keys()):
+                biome_data = replace_selections[(category, biome_name)]
+                day_replace = biome_data.get('day', {})  # dict of {index: path}
+                night_replace = biome_data.get('night', {})  # dict of {index: path}
+                
+                replace_count = len(day_replace) + len(night_replace)
+                
+                print(f'[TRACKS_VIEWER] Replace: {category}/{biome_name}: {len(day_replace)} day, {len(night_replace)} night')
+                
+                # Get vanilla tracks for this biome
+                vanilla_data = get_vanilla_tracks_for_biome(category, biome_name)
+                day_vanilla = vanilla_data.get('dayTracks', [])
+                night_vanilla = vanilla_data.get('nightTracks', [])
+                
+                # Biome header with Remove button
+                biome_header = QHBoxLayout()
+                biome_label = QLabel(f'  📍 {category.upper()}: {biome_name}')
+                biome_label.setStyleSheet('color: #ffcccc; font-weight: bold; font-size: 11px;')
+                biome_header.addWidget(biome_label)
+                
+                count_label = QLabel(f'({replace_count} replacement{"" if replace_count == 1 else "s"})')
+                count_label.setStyleSheet('color: #ff9999; font-size: 9px;')
+                biome_header.addWidget(count_label)
+                biome_header.addStretch()
+                
+                # Add Remove biome button
+                remove_biome_btn = QPushButton('✕ Remove')
+                remove_biome_btn.setFixedWidth(80)
+                remove_biome_btn.setStyleSheet('''QPushButton {
+                    background-color: #8b3a3a;
+                    color: white;
+                    font-size: 9px;
+                    padding: 2px;
+                    border-radius: 3px;
+                    border: 1px solid #a04a4a;
+                }
+                QPushButton:hover {
+                    background-color: #a04a4a;
+                    border: 1px solid #c05a5a;
+                }''')
+                remove_biome_btn.setToolTip(f'Remove {biome_name} from Replace selection')
+                remove_biome_btn.clicked.connect(partial(self._remove_replace_biome_and_refresh, (category, biome_name)))
+                biome_header.addWidget(remove_biome_btn)
+                
+                self.content_layout.addLayout(biome_header)
+                
+                # Day replacements
+                if day_replace:
+                    day_section = QVBoxLayout()
+                    day_title = QLabel(f'    🌅 Day ({len(day_replace)})')
+                    day_title.setStyleSheet('color: #FFD700; font-size: 10px;')
+                    day_section.addWidget(day_title)
+                    
+                    for idx, track_path in day_replace.items():
+                        # Get vanilla track name for this index
+                        vanilla_name = Path(day_vanilla[idx]).name if idx < len(day_vanilla) else '?'
+                        custom_name = Path(track_path).name
+                        
+                        track_item = QHBoxLayout()
+                        track_label = QLabel(f'      • {vanilla_name} → {custom_name}')
+                        track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
+                        track_item.addWidget(track_label)
+                        track_item.addStretch()
+                        
+                        delete_btn = QPushButton('✕')
+                        delete_btn.setFixedSize(20, 20)
+                        delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
+                        delete_btn.setToolTip(f'Remove replacement for {vanilla_name}')
+                        delete_btn.clicked.connect(partial(self._remove_replace_track_and_refresh, (category, biome_name), 'day', idx))
+                        track_item.addWidget(delete_btn)
+                        day_section.addLayout(track_item)
+                    
+                    self.content_layout.addLayout(day_section)
+                
+                # Night replacements
+                if night_replace:
+                    night_section = QVBoxLayout()
+                    night_title = QLabel(f'    🌙 Night ({len(night_replace)})')
+                    night_title.setStyleSheet('color: #87CEEB; font-size: 10px;')
+                    night_section.addWidget(night_title)
+                    
+                    for idx, track_path in night_replace.items():
+                        # Get vanilla track name for this index
+                        vanilla_name = Path(night_vanilla[idx]).name if idx < len(night_vanilla) else '?'
+                        custom_name = Path(track_path).name
+                        
+                        track_item = QHBoxLayout()
+                        track_label = QLabel(f'      • {vanilla_name} → {custom_name}')
+                        track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
+                        track_item.addWidget(track_label)
+                        track_item.addStretch()
+                        
+                        delete_btn = QPushButton('✕')
+                        delete_btn.setFixedSize(20, 20)
+                        delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
+                        delete_btn.setToolTip(f'Remove replacement for {vanilla_name}')
+                        delete_btn.clicked.connect(partial(self._remove_replace_track_and_refresh, (category, biome_name), 'night', idx))
+                        track_item.addWidget(delete_btn)
+                        night_section.addLayout(track_item)
+                    
+                    self.content_layout.addLayout(night_section)
+                
+                self.content_layout.addSpacing(6)
 
     def refresh_display(self):
         """Rebuild the tracks display"""
         try:
             print(f'[TRACKS_VIEWER] refresh_display() called')
             
-            # Clear old widgets - recursive clearing for nested layouts
-            def clear_layout(layout):
+            # Import for process events
+            from PyQt5.QtCore import QCoreApplication
+            
+            # Disable updates while building - prevents visual artifacts/bleeding
+            self.setUpdatesEnabled(False)
+            
+            # Scroll to top before clearing and rebuilding
+            self.scroll_area.verticalScrollBar().setValue(0)
+            
+            # Clear old widgets from content_layout (recursive helper)
+            def clear_all_layouts(layout):
+                """Recursively clear all widgets and nested layouts"""
                 while layout.count():
                     item = layout.takeAt(0)
                     if item.widget():
-                        item.widget().deleteLater()
+                        widget = item.widget()
+                        widget.deleteLater()
                     elif item.layout():
-                        clear_layout(item.layout())
+                        clear_all_layouts(item.layout())
+                        
+            clear_all_layouts(self.content_layout)
             
-            print(f'[TRACKS_VIEWER] Clearing old widgets (count={self.content_layout.count()})')
-            clear_layout(self.content_layout)
+            # Allow Qt to process user events (responsive UI) but don't redraw yet
+            QCoreApplication.processEvents()
+            
+            # Clear search to show all tracks again
+            self.search_input.blockSignals(True)
+            self.search_input.clear()
+            self.search_input.blockSignals(False)
+            self.current_search = ''
+            
+            # Reset track data
+            self.all_track_data = []
             
             # Check if we're in Both mode
             patch_mode = getattr(self.main_window, 'patch_mode', 'add')
@@ -5159,132 +7000,22 @@ class TracksViewerWindow(QDialog):
             if patch_mode == 'both' and replace_selections:
                 print(f'[TRACKS_VIEWER] Both mode detected - showing Replace + Add tracks')
                 
-                # SECTION 1: TRACKS TO REPLACE
-                replace_header = QLabel('🔄 TRACKS TO REPLACE')
-                replace_header.setStyleSheet('color: #ff9999; font-weight: bold; font-size: 13px; margin-bottom: 4px; margin-top: 8px;')
-                self.content_layout.addWidget(replace_header)
+                # SECTION 1: TRACKS TO REPLACE (use shared method)
+                self._display_replace_tracks_section()
                 
-                for (category, biome_name) in sorted(replace_selections.keys()):
-                    biome_data = replace_selections[(category, biome_name)]
-                    day_replace = biome_data.get('day', {})  # dict of {index: path}
-                    night_replace = biome_data.get('night', {})  # dict of {index: path}
-                    
-                    replace_count = len(day_replace) + len(night_replace)
-                    
-                    print(f'[TRACKS_VIEWER] Replace: {category}/{biome_name}: {len(day_replace)} day, {len(night_replace)} night')
-                    
-                    # Biome header
-                    biome_header = QHBoxLayout()
-                    biome_label = QLabel(f'  📍 {category.upper()}: {biome_name}')
-                    biome_label.setStyleSheet('color: #ffcccc; font-weight: bold; font-size: 11px;')
-                    biome_header.addWidget(biome_label)
-                    
-                    count_label = QLabel(f'({replace_count} replacement{"" if replace_count == 1 else "s"})')
-                    count_label.setStyleSheet('color: #ff9999; font-size: 9px;')
-                    biome_header.addWidget(count_label)
-                    biome_header.addStretch()
-                    
-                    self.content_layout.addLayout(biome_header)
-                    
-                    # Day replacements
-                    if day_replace:
-                        day_section = QVBoxLayout()
-                        day_title = QLabel(f'    🌅 Day ({len(day_replace)})')
-                        day_title.setStyleSheet('color: #FFD700; font-size: 10px;')
-                        day_section.addWidget(day_title)
-                        
-                        for idx, track_path in day_replace.items():
-                            track_name = Path(track_path).name
-                            track_label = QLabel(f'      • [{idx}] {track_name}')
-                            track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
-                            day_section.addWidget(track_label)
-                        
-                        self.content_layout.addLayout(day_section)
-                    
-                    # Night replacements
-                    if night_replace:
-                        night_section = QVBoxLayout()
-                        night_title = QLabel(f'    🌙 Night ({len(night_replace)})')
-                        night_title.setStyleSheet('color: #87CEEB; font-size: 10px;')
-                        night_section.addWidget(night_title)
-                        
-                        for idx, track_path in night_replace.items():
-                            track_name = Path(track_path).name
-                            track_label = QLabel(f'      • [{idx}] {track_name}')
-                            track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
-                            night_section.addWidget(track_label)
-                        
-                        self.content_layout.addLayout(night_section)
-                    
-                    self.content_layout.addSpacing(6)
-                
-                # SECTION 2: TRACKS TO ADD
-                if add_selections:
-                    add_header = QLabel('➕ TRACKS TO ADD')
-                    add_header.setStyleSheet('color: #99ff99; font-weight: bold; font-size: 13px; margin-bottom: 4px; margin-top: 12px; padding-top: 8px; border-top: 1px solid #3a4a6a;')
-                    self.content_layout.addWidget(add_header)
-                    
-                    for (category, biome_name) in sorted(add_selections.keys()):
-                        biome_data = add_selections[(category, biome_name)]
-                        day_tracks = biome_data.get('day', [])
-                        night_tracks = biome_data.get('night', [])
-                        
-                        add_count = len(day_tracks) + len(night_tracks)
-                        
-                        print(f'[TRACKS_VIEWER] Add: {category}/{biome_name}: {len(day_tracks)} day, {len(night_tracks)} night')
-                        
-                        # Biome header
-                        biome_header = QHBoxLayout()
-                        biome_label = QLabel(f'  📍 {category.upper()}: {biome_name}')
-                        biome_label.setStyleSheet('color: #ccffcc; font-weight: bold; font-size: 11px;')
-                        biome_header.addWidget(biome_label)
-                        
-                        count_label = QLabel(f'({add_count} addition{"" if add_count == 1 else "s"})')
-                        count_label.setStyleSheet('color: #99ff99; font-size: 9px;')
-                        biome_header.addWidget(count_label)
-                        biome_header.addStretch()
-                        
-                        self.content_layout.addLayout(biome_header)
-                        
-                        # Day additions
-                        if day_tracks:
-                            day_section = QVBoxLayout()
-                            day_title = QLabel(f'    🌅 Day ({len(day_tracks)})')
-                            day_title.setStyleSheet('color: #FFD700; font-size: 10px;')
-                            day_section.addWidget(day_title)
-                            
-                            for track_path in day_tracks:
-                                track_name = Path(track_path).name
-                                track_label = QLabel(f'      • {track_name}')
-                                track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
-                                day_section.addWidget(track_label)
-                            
-                            self.content_layout.addLayout(day_section)
-                        
-                        # Night additions
-                        if night_tracks:
-                            night_section = QVBoxLayout()
-                            night_title = QLabel(f'    🌙 Night ({len(night_tracks)})')
-                            night_title.setStyleSheet('color: #87CEEB; font-size: 10px;')
-                            night_section.addWidget(night_title)
-                            
-                            for track_path in night_tracks:
-                                track_name = Path(track_path).name
-                                track_label = QLabel(f'      • {track_name}')
-                                track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
-                                night_section.addWidget(track_label)
-                            
-                            self.content_layout.addLayout(night_section)
-                        
-                        self.content_layout.addSpacing(6)
-                else:
-                    no_add_msg = QLabel('  (no tracks to add yet)')
-                    no_add_msg.setStyleSheet('color: #666; font-size: 10px; font-style: italic; margin-left: 8px;')
-                    self.content_layout.addWidget(no_add_msg)
+                # SECTION 2: NEW TRACKS WILL BE ADDED (use shared method)
+                self._display_add_tracks_section()
             
             # STANDARD MODE: Show ADD tracks only (Add or Replace mode)
             else:
                 print(f'[TRACKS_VIEWER] Standard mode - showing Add tracks only')
+                
+                # 🆕 REPLACE MODE: Show TRACKS TO REPLACE
+                if patch_mode == 'replace' and replace_selections:
+                    print(f'[TRACKS_VIEWER] Replace mode detected - showing Replace tracks')
+                    
+                    # Use shared helper method for Replace tracks display
+                    self._display_replace_tracks_section()
                 
                 # 🆕 Check if Remove Vanilla Tracks is enabled (Add mode only)
                 remove_vanilla = getattr(self.main_window, 'remove_vanilla_tracks', False)
@@ -5296,8 +7027,9 @@ class TracksViewerWindow(QDialog):
                     
                     # Header with title and cancel button
                     remove_header_layout = QHBoxLayout()
-                    remove_header_label = QLabel('🗑️ VANILLA TRACKS WILL BE REMOVED')
+                    remove_header_label = QLabel('🗑️ VANILLA TRACKS WILL BE REMOVED (100% of your music guaranteed)')
                     remove_header_label.setStyleSheet('color: #ff9999; font-weight: bold; font-size: 13px;')
+                    remove_header_label.setToolTip('Remove Mode: ONLY your custom music will play. ⚠️ Can conflict with other REPLACE-based music mods.')
                     remove_header_layout.addWidget(remove_header_label)
                     remove_header_layout.addStretch()
                     
@@ -5383,143 +7115,23 @@ class TracksViewerWindow(QDialog):
                     separator.setStyleSheet('border-top: 1px solid #3a4a6a; margin: 12px 0px;')
                     self.content_layout.addWidget(separator)
                     
-                    # ADD tracks header
-                    add_header = QLabel('➕ NEW TRACKS WILL BE ADDED')
-                    add_header.setStyleSheet('color: #99ff99; font-weight: bold; font-size: 13px; margin-bottom: 4px; margin-top: 8px;')
-                    self.content_layout.addWidget(add_header)
-                
-                if not add_selections:
-                    print(f'[TRACKS_VIEWER] No selections, showing empty message')
-                    empty_label = QLabel('No tracks selected yet.')
-                    empty_label.setStyleSheet('color: #b19cd9; font-style: italic; font-size: 11px;')
-                    empty_label.setAlignment(Qt.AlignCenter)
-                    self.content_layout.addWidget(empty_label)
+                if patch_mode == 'replace':
+                    # In Replace mode, show ADD header only if there are Add selections
+                    if add_selections:
+                        self._display_add_tracks_section()
                 else:
-                    total_tracks = 0
-                    print(f'[TRACKS_VIEWER] Building display for {len(add_selections)} biome(s)')
-                    
-                    for (category, biome_name) in sorted(add_selections.keys()):
-                        biome_data = add_selections[(category, biome_name)]
-                        day_tracks = biome_data.get('day', [])
-                        night_tracks = biome_data.get('night', [])
-                        
-                        biome_count = len(day_tracks) + len(night_tracks)
-                        
-                        print(f'[TRACKS_VIEWER] Processing {category}/{biome_name}: {len(day_tracks)} day, {len(night_tracks)} night')
-                        
-                        # Biome header with count and remove button
-                        biome_header = QHBoxLayout()
-                        biome_label = QLabel(f'📍 {category.upper()}: {biome_name}')
-                        biome_label.setStyleSheet('color: #00d4ff; font-weight: bold; font-size: 12px;')
-                        biome_header.addWidget(biome_label)
-                        
-                        count_label = QLabel(f'({biome_count} track{"" if biome_count == 1 else "s"})')
-                        count_label.setStyleSheet('color: #b19cd9; font-size: 10px;')
-                        biome_header.addWidget(count_label)
-                        biome_header.addStretch()
-                        
-                        # Add remove biome button
-                        remove_biome_btn = QPushButton('✕ Remove')
-                        remove_biome_btn.setFixedWidth(80)
-                        remove_biome_btn.setStyleSheet('''QPushButton {
-                            background-color: #8b3a3a;
-                            color: white;
-                            font-size: 9px;
-                            padding: 2px;
-                            border-radius: 3px;
-                            border: 1px solid #a04a4a;
-                        }
-                        QPushButton:hover {
-                            background-color: #a04a4a;
-                            border: 1px solid #c05a5a;
-                        }''')
-                        remove_biome_btn.setToolTip(f'Remove {biome_name} from selection')
-                        remove_biome_btn.clicked.connect(partial(self._remove_biome_and_refresh, (category, biome_name)))
-                        biome_header.addWidget(remove_biome_btn)
-                        
-                        self.content_layout.addLayout(biome_header)
-                        
-                        # If empty, show message
-                        if biome_count == 0:
-                            empty_msg = QLabel('    (no tracks selected yet)')
-                            empty_msg.setStyleSheet('color: #666; font-size: 9px; font-style: italic;')
-                            self.content_layout.addWidget(empty_msg)
-                        else:
-                            # Day tracks
-                            if day_tracks:
-                                print(f'[TRACKS_VIEWER] Adding {len(day_tracks)} day tracks')
-                                day_section = QVBoxLayout()
-                                day_title = QHBoxLayout()
-                                day_label = QLabel(f'  🌅 Day ({len(day_tracks)})')
-                                day_label.setStyleSheet('color: #FFD700; font-weight: bold; font-size: 11px;')
-                                day_title.addWidget(day_label)
-                                day_title.addStretch()
-                                
-                                clear_btn = QPushButton('Clear All')
-                                clear_btn.setFixedWidth(70)
-                                clear_btn.setStyleSheet('background-color: #c41e3a; color: white; font-size: 9px; padding: 3px; border-radius: 3px;')
-                                clear_btn.clicked.connect(partial(self._clear_biome_and_refresh, (category, biome_name), 'day'))
-                                day_title.addWidget(clear_btn)
-                                day_section.addLayout(day_title)
-                                
-                                for track_path in day_tracks:
-                                    track_item = QHBoxLayout()
-                                    track_name = Path(track_path).name
-                                    track_label = QLabel(f'    • {track_name}')
-                                    track_label.setStyleSheet('color: #e6ecff; font-size: 10px;')
-                                    track_item.addWidget(track_label)
-                                    track_item.addStretch()
-                                    
-                                    delete_btn = QPushButton('✕')
-                                    delete_btn.setFixedSize(20, 20)
-                                    delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
-                                    delete_btn.setToolTip(f'Remove {track_name}')
-                                    delete_btn.clicked.connect(partial(self._remove_track_and_refresh, (category, biome_name), 'day', track_path))
-                                    track_item.addWidget(delete_btn)
-                                    day_section.addLayout(track_item)
-                                
-                                self.content_layout.addLayout(day_section)
-                            
-                            # Night tracks
-                            if night_tracks:
-                                print(f'[TRACKS_VIEWER] Adding {len(night_tracks)} night tracks')
-                                night_section = QVBoxLayout()
-                                night_title = QHBoxLayout()
-                                night_label = QLabel(f'  🌙 Night ({len(night_tracks)})')
-                                night_label.setStyleSheet('color: #87CEEB; font-weight: bold; font-size: 11px;')
-                                night_title.addWidget(night_label)
-                                night_title.addStretch()
-                                
-                                clear_btn = QPushButton('Clear All')
-                                clear_btn.setFixedWidth(70)
-                                clear_btn.setStyleSheet('background-color: #c41e3a; color: white; font-size: 9px; padding: 3px; border-radius: 3px;')
-                                clear_btn.clicked.connect(partial(self._clear_biome_and_refresh, (category, biome_name), 'night'))
-                                night_title.addWidget(clear_btn)
-                                night_section.addLayout(night_title)
-                                
-                                for track_path in night_tracks:
-                                    track_item = QHBoxLayout()
-                                    track_name = Path(track_path).name
-                                    track_label = QLabel(f'    • {track_name}')
-                                    track_label.setStyleSheet('color: #e6ecff; font-size: 10px;')
-                                    track_item.addWidget(track_label)
-                                    track_item.addStretch()
-                                    
-                                    delete_btn = QPushButton('✕')
-                                    delete_btn.setFixedSize(20, 20)
-                                    delete_btn.setStyleSheet('background-color: #c41e3a; color: white; font-weight: bold; padding: 0px; border-radius: 3px; font-size: 10px;')
-                                    delete_btn.setToolTip(f'Remove {track_name}')
-                                    delete_btn.clicked.connect(partial(self._remove_track_and_refresh, (category, biome_name), 'night', track_path))
-                                    track_item.addWidget(delete_btn)
-                                    night_section.addLayout(track_item)
-                                
-                                self.content_layout.addLayout(night_section)
-                        
-                        self.content_layout.addSpacing(8)
-                        total_tracks += biome_count
+                    # In Add mode, always show ADD header and tracks
+                    self._display_add_tracks_section()
+            
+            # 🆕 Collect track data for search (after building full display)
+            self._collect_track_data()
             
             # Add stretch at end to push content to top (prevents floating blank space)
             self.content_layout.addStretch()
+            
+            # Re-enable updates and redraw the completed display
+            self.setUpdatesEnabled(True)
+            self.update()  # Force full redraw now that we're done
             
             # Scroll to top to ensure clean display
             self.scroll_area.verticalScrollBar().setValue(0)
@@ -5527,11 +7139,580 @@ class TracksViewerWindow(QDialog):
             import traceback
             print(f'[TRACKS_VIEWER] Error in refresh_display: {e}')
             traceback.print_exc()
+    
+    def _collect_track_data(self):
+        """Collect all track data for search filtering"""
+        self.all_track_data = []
+        self.search_index = []  # Rebuild lightweight index for searching
+        
+        patch_mode = getattr(self.main_window, 'patch_mode', 'add')
+        replace_selections = getattr(self.main_window, 'replace_selections', {})
+        add_selections = getattr(self.main_window, 'add_selections', {})
+        
+        # Collect Replace tracks (in Both mode)
+        for biome in sorted(replace_selections.keys()):
+            data = replace_selections[biome]
+            biome_data = {
+                'biome': biome,
+                'day': data.get('day', {}),
+                'night': data.get('night', {}),
+                'is_replace': True
+            }
+            self.all_track_data.append(biome_data)
+            
+            # Add to search index
+            category, biome_name = biome
+            biome_text = f'{category} {biome_name}'.lower()
+            index_entry = {
+                'biome': biome,
+                'biome_text': biome_text,
+                'tracks': []
+            }
+            
+            # Index day tracks
+            for idx, path in data.get('day', {}).items():
+                track_name = Path(str(path)).name.lower()
+                index_entry['tracks'].append((track_name, path, True, True, idx))
+            
+            # Index night tracks
+            for idx, path in data.get('night', {}).items():
+                track_name = Path(str(path)).name.lower()
+                index_entry['tracks'].append((track_name, path, False, True, idx))
+            
+            if index_entry['tracks']:
+                self.search_index.append(index_entry)
+        
+        # Collect Add tracks (in both Add and Both mode)
+        for biome in sorted(add_selections.keys()):
+            data = add_selections[biome]
+            biome_data = {
+                'biome': biome,
+                'day': data.get('day', []),
+                'night': data.get('night', []),
+                'is_replace': False
+            }
+            self.all_track_data.append(biome_data)
+            
+            # Add to search index
+            category, biome_name = biome
+            biome_text = f'{category} {biome_name}'.lower()
+            index_entry = {
+                'biome': biome,
+                'biome_text': biome_text,
+                'tracks': []
+            }
+            
+            # Index day tracks
+            for path in data.get('day', []):
+                track_name = Path(str(path)).name.lower()
+                index_entry['tracks'].append((track_name, path, True, False, None))
+            
+            # Index night tracks
+            for path in data.get('night', []):
+                track_name = Path(str(path)).name.lower()
+                index_entry['tracks'].append((track_name, path, False, False, None))
+            
+            if index_entry['tracks']:
+                self.search_index.append(index_entry)
+    
+    def _display_filtered_results(self, filtered_data, total_count):
+        """Display the pre-filtered search results (called from worker thread)"""
+        # Scroll to top before clearing and rebuilding
+        self.scroll_area.verticalScrollBar().setValue(0)
+        
+        # Disable updates while building to keep UI responsive
+        self.setUpdatesEnabled(False)
+        
+        # Clear old widgets (recursive helper)
+        def clear_layout(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                elif item.layout():
+                    clear_layout(item.layout())
+        
+        clear_layout(self.content_layout)
+        
+        total_visible = 0
+        
+        # Process each biome's tracks
+        for biome_data in filtered_data:
+            biome = biome_data['biome']
+            category, biome_name = biome
+            is_replace = biome_data['is_replace']
+            day_data = biome_data['day']
+            night_data = biome_data['night']
+            
+            # Count total tracks for this biome
+            day_count = len(day_data)
+            night_count = len(night_data)
+            biome_total = day_count + night_count
+            
+            if biome_total == 0:
+                continue  # Skip empty biomes
+            
+            # Display biome header
+            biome_header = QHBoxLayout()
+            biome_label = QLabel(f'  📍 {category.upper()}: {biome_name}')
+            biome_label.setStyleSheet('color: #ccffcc; font-weight: bold; font-size: 11px;')
+            biome_header.addWidget(biome_label)
+            
+            count_label = QLabel(f'({biome_total} track{"" if biome_total == 1 else "s"})')
+            count_label.setStyleSheet('color: #99ff99; font-size: 9px;')
+            biome_header.addWidget(count_label)
+            biome_header.addStretch()
+            
+            self.content_layout.addLayout(biome_header)
+            
+            # Display day tracks
+            if day_data:
+                day_section = QVBoxLayout()
+                day_title = QLabel(f'    🌅 Day')
+                day_title.setStyleSheet('color: #FFD700; font-size: 10px;')
+                day_section.addWidget(day_title)
+                
+                for idx, (key, track_path) in enumerate(day_data.items() if is_replace else enumerate(day_data)):
+                    track_name = Path(str(track_path)).name
+                    label_text = f'      • [{key}] {track_name}' if is_replace else f'      • {track_name}'
+                    
+                    # Create horizontal layout for track with delete button
+                    track_row = QHBoxLayout()
+                    track_row.setContentsMargins(0, 0, 0, 0)
+                    track_row.setSpacing(4)
+                    
+                    track_label = QLabel(label_text)
+                    track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
+                    track_row.addWidget(track_label)
+                    track_row.addStretch()
+                    
+                    # Add delete button for this track
+                    delete_btn = QPushButton('✕')
+                    delete_btn.setStyleSheet('background-color: #8B0000; color: white; border: none; font-size: 8px; padding: 1px 4px; border-radius: 2px;')
+                    delete_btn.setFixedSize(16, 16)
+                    delete_btn.setCursor(Qt.PointingHandCursor)
+                    delete_btn.clicked.connect(lambda checked=False, b=biome, t='day', p=track_path: self._remove_track_from_search_and_refresh(b, t, p))
+                    track_row.addWidget(delete_btn)
+                    
+                    day_section.addLayout(track_row)
+                    total_visible += 1
+                    
+                    # Allow UI to respond every 15 widgets
+                    if (idx + 1) % 15 == 0:
+                        QCoreApplication.processEvents()
+                
+                self.content_layout.addLayout(day_section)
+            
+            # Display night tracks
+            if night_data:
+                night_section = QVBoxLayout()
+                night_title = QLabel(f'    🌙 Night')
+                night_title.setStyleSheet('color: #87CEEB; font-size: 10px;')
+                night_section.addWidget(night_title)
+                
+                for idx, (key, track_path) in enumerate(night_data.items() if is_replace else enumerate(night_data)):
+                    track_name = Path(str(track_path)).name
+                    label_text = f'      • [{key}] {track_name}' if is_replace else f'      • {track_name}'
+                    
+                    # Create horizontal layout for track with delete button
+                    track_row = QHBoxLayout()
+                    track_row.setContentsMargins(0, 0, 0, 0)
+                    track_row.setSpacing(4)
+                    
+                    track_label = QLabel(label_text)
+                    track_label.setStyleSheet('color: #e6ecff; font-size: 9px;')
+                    track_row.addWidget(track_label)
+                    track_row.addStretch()
+                    
+                    # Add delete button for this track
+                    delete_btn = QPushButton('✕')
+                    delete_btn.setStyleSheet('background-color: #8B0000; color: white; border: none; font-size: 8px; padding: 1px 4px; border-radius: 2px;')
+                    delete_btn.setFixedSize(16, 16)
+                    delete_btn.setCursor(Qt.PointingHandCursor)
+                    delete_btn.clicked.connect(lambda checked=False, b=biome, t='night', p=track_path: self._remove_track_from_search_and_refresh(b, t, p))
+                    track_row.addWidget(delete_btn)
+                    
+                    night_section.addLayout(track_row)
+                    total_visible += 1
+                    
+                    # Allow UI to respond every 15 widgets
+                    if (idx + 1) % 15 == 0:
+                        QCoreApplication.processEvents()
+                
+                self.content_layout.addLayout(night_section)
+            
+            self.content_layout.addSpacing(6)
+        
+        self.content_layout.addStretch()
+        
+        # Re-enable updates and redraw
+        self.setUpdatesEnabled(True)
+        self.update()
+        
+        # Update count display
+        if self.current_search:
+            self.count_label.setText(f'({total_visible} / {total_count})')
+            self.count_label.setStyleSheet('color: #FFD700; font-size: 10px; min-width: 60px; font-weight: bold;')
+        else:
+            self.count_label.setText(f'({total_visible} / {total_count})')
+            self.count_label.setStyleSheet('color: #b19cd9; font-size: 10px; min-width: 60px;')
+
+
+# Worker class for threaded patch generation
+class PatchGenerationWorker(QThread):
+    """Background worker for patch generation - keeps UI responsive"""
+    progress_update = pyqtSignal(str)  # Status message updates
+    generation_complete = pyqtSignal(dict)  # Results when done: {success, results, error_msg}
+    
+    def __init__(self, main_window, mod_name, format_choice):
+        super().__init__()
+        self.main_window = main_window
+        self.mod_name = mod_name
+        self.format_choice = format_choice
+    
+    def run(self):
+        """Execute patch generation in background thread"""
+        try:
+            self.progress_update.emit('🔧 Preparing patch generation...')
+            
+            # Call the actual generation logic (this is mostly the original function)
+            result = self._do_generation()
+            
+            self.generation_complete.emit({
+                'success': result.get('success', False),
+                'results': result.get('patch_results', []),
+                'error_msg': result.get('error', None)
+            })
+        except Exception as e:
+            print(f'[PATCH_WORKER] Error during generation: {e}')
+            import traceback
+            traceback.print_exc()
+            self.generation_complete.emit({
+                'success': False,
+                'results': [],
+                'error_msg': str(e)
+            })
+    
+    def _do_generation(self):
+        """The actual patch generation logic (moved from main thread)"""
+        # This is the core of generate_patch_file() but returns a dict instead of updating UI
+        try:
+            import shutil
+            from utils.patch_generator import generate_patch
+            from utils.atomicwriter import create_mod_folder_structure
+            
+            mod_name = self.mod_name
+            biomes = getattr(self.main_window, 'selected_biomes', [])
+            patch_mode = getattr(self.main_window, 'patch_mode', 'add')
+            replace_selections = getattr(self.main_window, 'replace_selections', {})
+            add_selections = getattr(self.main_window, 'add_selections', {})
+            day_tracks = getattr(self.main_window, 'day_tracks', [])
+            night_tracks = getattr(self.main_window, 'night_tracks', [])
+            remove_vanilla_tracks = getattr(self.main_window, 'remove_vanilla_tracks', False)
+            
+            # Construct mod_path once and clear old patches before regeneration
+            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
+            staging_dir = starsound_dir / 'staging'
+            safe_mod_name = "".join(c for c in mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+            mod_path = staging_dir / safe_mod_name
+            
+            # ✅ CRITICAL: Create mod folder structure with _metadata and required directories
+            self.progress_update.emit('📁 Creating mod folder structure...')
+            create_mod_folder_structure(staging_dir, safe_mod_name)
+            self.main_window.logger.log(f'Created mod folder structure for: {safe_mod_name}', context='PatchGen')
+            
+            # Clear old biomes folder to prevent patches from previous generations contaminating new ones
+            biomes_folder = mod_path / 'biomes'
+            if biomes_folder.exists():
+                try:
+                    shutil.rmtree(biomes_folder)
+                    self.main_window.logger.log('Cleared old biomes folder for fresh generation', context='PatchGen')
+                except Exception as e:
+                    self.main_window.logger.warn(f'Could not clear old biomes folder: {e}')
+            
+            # Also clear any stray .patch files in the mod root (shouldn't be there, but just in case)
+            try:
+                for patch_file in mod_path.glob('*.patch'):
+                    patch_file.unlink()
+                    self.main_window.logger.log(f'Removed stray patch file: {patch_file.name}', context='PatchGen')
+            except Exception as e:
+                self.main_window.logger.warn(f'Could not clear stray patch files: {e}')
+            
+            patch_results = []
+            
+            # CASE A: Replace mode with individual selections
+            if patch_mode == 'replace' and replace_selections:
+                self.progress_update.emit(f'🔧 Processing {len(biomes)} biome(s) in Replace mode...')
+                
+                for idx, (biome_category, biome_name) in enumerate(biomes, 1):
+                    self.progress_update.emit(f'🔧 Patching {biome_name} ({idx}/{len(biomes)})...')
+                    
+                    selections = replace_selections.get((biome_category, biome_name), {})
+                    if not selections:
+                        continue
+                    
+                    config = {
+                        'biome': biome_name,
+                        'biome_category': biome_category,
+                        'modName': mod_name,
+                        'patchMode': patch_mode
+                    }
+                    
+                    result = generate_patch(str(mod_path), config, replace_selections=selections, logger=self.main_window.logger)
+                    patch_results.append(result)
+            
+            # CASE B: Both mode
+            elif patch_mode == 'both' and replace_selections:
+                self.progress_update.emit(f'🔧 Processing {len(biomes)} biome(s) in Both mode...')
+                
+                both_mode_biomes = set(biomes) | set(replace_selections.keys())
+                
+                for idx, (biome_category, biome_name) in enumerate(sorted(both_mode_biomes), 1):
+                    self.progress_update.emit(f'🔧 Patching {biome_name} ({idx}/{len(both_mode_biomes)})...')
+                    
+                    replace_sel = replace_selections.get((biome_category, biome_name), {})
+                    add_sel = add_selections.get((biome_category, biome_name), {'day': [], 'night': []})
+                    day_add_tracks = add_sel.get('day', [])
+                    night_add_tracks = add_sel.get('night', [])
+                    
+                    if not day_add_tracks and not night_add_tracks:
+                        day_add_tracks = day_tracks
+                        night_add_tracks = night_tracks
+                    
+                    if not replace_sel:
+                        if not (day_add_tracks or night_add_tracks):
+                            continue
+                    
+                    config = {
+                        'biome': biome_name,
+                        'biome_category': biome_category,
+                        'dayTracks': day_add_tracks,
+                        'nightTracks': night_add_tracks,
+                        'modName': mod_name,
+                        'patchMode': 'both'
+                    }
+                    
+                    result = generate_patch(str(mod_path), config, replace_selections=replace_sel, logger=self.main_window.logger)
+                    patch_results.append(result)
+            
+            # CASE C: Standard Add/Replace
+            else:
+                self.progress_update.emit(f'🔧 Processing {len(biomes)} biome(s) in Add mode...')
+                
+                has_add_selections = bool(add_selections)
+                
+                for idx, (biome_category, biome_name) in enumerate(biomes, 1):
+                    self.progress_update.emit(f'🔧 Patching {biome_name} ({idx}/{len(biomes)})...')
+                    
+                    if has_add_selections:
+                        biome_key = (biome_category, biome_name)
+                        biome_tracks = add_selections.get(biome_key, {'day': [], 'night': []})
+                        day_biome_tracks = biome_tracks.get('day', [])
+                        night_biome_tracks = biome_tracks.get('night', [])
+                        
+                        if not day_biome_tracks and not night_biome_tracks:
+                            continue
+                        
+                        config = {
+                            'biome': biome_name,
+                            'biome_category': biome_category,
+                            'dayTracks': day_biome_tracks,
+                            'nightTracks': night_biome_tracks,
+                            'modName': mod_name,
+                            'patchMode': patch_mode,
+                            'trackType': 'Both',
+                            'remove_vanilla_tracks': remove_vanilla_tracks
+                        }
+                    else:
+                        config = {
+                            'biome': biome_name,
+                            'biome_category': biome_category,
+                            'dayTracks': day_tracks,
+                            'nightTracks': night_tracks,
+                            'modName': mod_name,
+                            'patchMode': patch_mode,
+                            'trackType': 'Both',
+                            'remove_vanilla_tracks': remove_vanilla_tracks
+                        }
+                    
+                    result = generate_patch(str(mod_path), config, logger=self.main_window.logger)
+                    patch_results.append(result)
+            
+            self.progress_update.emit('✅ Generation complete!')
+            
+            # Clean up old backups folder in staging (if it exists)
+            # All backups are now at root-level StarSound/backups/
+            try:
+                old_backups_path = mod_path / 'backups'
+                if old_backups_path.exists():
+                    import shutil
+                    shutil.rmtree(old_backups_path)
+                    self.main_window.logger.log(f'Cleaned up old backups folder from staging: {old_backups_path}')
+            except Exception as e:
+                self.main_window.logger.warn(f'Could not clean up old backups folder: {e}')
+            
+            return {
+                'success': all(r.get('success') for r in patch_results) if patch_results else False,
+                'patch_results': patch_results,
+                'error': None
+            }
+        
+        except Exception as e:
+            return {
+                'success': False,
+                'patch_results': [],
+                'error': str(e)
+            }
+
+
+# Worker class for mod export/installation
+class ExportWorker(QThread):
+    """Background worker for mod export to Starbound mods folder"""
+    progress_update = pyqtSignal(dict)  # {message: str, percentage: int}
+    export_complete = pyqtSignal(dict)  # Results: {success, message, installed_path, error_msg}
+    
+    def __init__(self, main_window, mod_name, use_pak):
+        super().__init__()
+        self.main_window = main_window
+        self.mod_name = mod_name
+        self.use_pak = use_pak
+    
+    def run(self):
+        """Execute mod export in background thread"""
+        try:
+            self.progress_update.emit({'message': '📦 Finding Starbound installation...', 'percentage': 10})
+            result = self._do_export()
+            self.export_complete.emit(result)
+        except Exception as e:
+            print(f'[EXPORT_WORKER] Error during export: {e}')
+            import traceback
+            traceback.print_exc()
+            self.export_complete.emit({
+                'success': False,
+                'message': '',
+                'installed_path': '',
+                'error_msg': str(e)
+            })
+    
+    def _do_export(self):
+        """The actual export logic"""
+        try:
+            from utils.starbound_locator import find_starbound_folder
+            from utils.mod_exporter import export_mod_loose, export_mod_pak
+            import shutil
+            
+            self.progress_update.emit({'message': '📂 Preparing mod files...', 'percentage': 15})
+            
+            # Locate staging and Starbound
+            starsound_dir = Path(os.path.dirname(os.path.dirname(__file__)))
+            staging_dir = starsound_dir / 'staging'
+            safe_mod_name = "".join(c for c in self.mod_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+            staging_mod_path = staging_dir / safe_mod_name
+            
+            # Count total files for informational purposes
+            total_files = sum(1 for _ in staging_mod_path.rglob('*') if _.is_file())
+            
+            self.progress_update.emit({'message': f'📊 {total_files} files to copy...', 'percentage': 25})
+            
+            # Find Starbound installation
+            self.progress_update.emit({'message': '🔍 Locating Starbound installation...', 'percentage': 35})
+            starbound_path = find_starbound_folder()
+            if not starbound_path:
+                return {
+                    'success': False,
+                    'message': 'Could not find Starbound installation',
+                    'installed_path': '',
+                    'error_msg': 'Starbound folder not found'
+                }
+            
+            starbound_mods_path = Path(starbound_path) / 'mods'
+            starbound_mods_path.mkdir(parents=True, exist_ok=True)
+            
+            self.progress_update.emit({'message': f'📁 Destination: {starbound_mods_path}', 'percentage': 45})
+            
+            # Export based on format selection
+            self.progress_update.emit({'message': f'💾 Starting mod export ({total_files} files)...', 'percentage': 55})
+            
+            if self.use_pak:
+                success, message, installed_path = export_mod_pak(
+                    staging_mod_path,
+                    starbound_mods_path,
+                    Path(starbound_path),
+                    logger=self.main_window.logger
+                )
+            else:
+                # For loose export, do copying manually so we can track each file
+                success = True
+                installed_path = str(starbound_mods_path / safe_mod_name)
+                message = f'Mod installed to: {installed_path}'
+                
+                try:
+                    target_mod_path = Path(installed_path)
+                    
+                    # Delete existing mod folder to ensure clean installation (no old patches remain)
+                    if target_mod_path.exists():
+                        self.progress_update.emit({
+                            'message': f'🗑️  Removing old mod version...',
+                            'percentage': 57
+                        })
+                        import shutil
+                        shutil.rmtree(target_mod_path)
+                        self.main_window.logger.log(f'Deleted existing mod folder for clean reinstall: {target_mod_path}')
+                    
+                    target_mod_path.mkdir(parents=True, exist_ok=True)
+                    
+                    # Copy files and track progress
+                    files_copied = 0
+                    for src_file in staging_mod_path.rglob('*'):
+                        if src_file.is_file():
+                            files_copied += 1
+                            # Calculate relative path for display
+                            rel_path = src_file.relative_to(staging_mod_path)
+                            file_name = src_file.name
+                            
+                            # Emit per-file progress
+                            percentage = int(60 + (files_copied / max(total_files, 1)) * 30)  # 60-90%
+                            self.progress_update.emit({
+                                'message': f'📋 Copying: {file_name} ({files_copied}/{total_files})',
+                                'percentage': percentage
+                            })
+                            
+                            # Copy file
+                            dst_file = target_mod_path / rel_path
+                            dst_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src_file, dst_file)
+                    
+                except Exception as e:
+                    success = False
+                    message = f'Failed to copy files: {e}'
+                    installed_path = ''
+            
+            self.progress_update.emit({'message': '⏳ Finalizing installation...', 'percentage': 90})
+            
+            if success:
+                self.progress_update.emit({'message': '✅ Installation complete!', 'percentage': 100})
+            
+            return {
+                'success': success,
+                'message': message,
+                'installed_path': installed_path,
+                'error_msg': None if success else message
+            }
+        
+        except Exception as e:
+            return {
+                'success': False,
+                'message': '',
+                'installed_path': '',
+                'error_msg': str(e)
+            }
 
 
 if __name__ == '__main__':
     import atexit
     app = QApplication(sys.argv)
+    # Apply centralized stylesheet based on UI_STYLE_GUIDE
+    apply_global_stylesheet(app)
     window = MainWindow()
     window.show()
     def log_exit():
@@ -5540,4 +7721,89 @@ if __name__ == '__main__':
         except Exception:
             pass
     atexit.register(log_exit)
-    sys.exit(app.exec_())
+
+
+# SearchFilterWorker - background thread for fast track searching
+class SearchFilterWorker(QThread):
+    """Background worker for filtering tracks - keeps UI responsive during search"""
+    filter_complete = pyqtSignal(list, int)  # Emits (filtered_data, total_count)
+    
+    def __init__(self, search_index, query):
+        super().__init__()
+        self.search_index = search_index  # Lightweight index of all tracks
+        self.query = query.lower().strip()  # Search query
+    
+    def run(self):
+        """Execute search in background thread"""
+        try:
+            if not self.query:
+                # No search - return all data
+                filtered_data = []
+                total_count = 0
+                # This shouldn't happen (called from UI), but handle it
+                self.filter_complete.emit([], 0)
+                return
+            
+            # Fast search through lightweight index
+            filtered_data = []
+            total_count = sum(len(entry['tracks']) for entry in self.search_index)
+            
+            for index_entry in self.search_index:
+                biome = index_entry['biome']
+                biome_text = index_entry['biome_text']
+                
+                # Check if biome matches
+                biome_matches = self.query in biome_text
+                
+                # Collect matching tracks
+                day_dict = {}
+                night_dict = {}
+                day_list = []
+                night_list = []
+                is_replace = None
+                
+                for track_name, track_path, is_day, is_replace_mode, key_idx in index_entry['tracks']:
+                    # Track matches if biome matches OR track name matches
+                    if biome_matches or self.query in track_name:
+                        is_replace = is_replace_mode
+                        
+                        if is_replace_mode:
+                            # Replace mode: store as dict with index
+                            if is_day:
+                                day_dict[key_idx] = track_path
+                            else:
+                                night_dict[key_idx] = track_path
+                        else:
+                            # Add mode: store as list
+                            if is_day:
+                                day_list.append(track_path)
+                            else:
+                                night_list.append(track_path)
+                
+                # Only include biome if it has matching tracks
+                if day_dict or night_dict or day_list or night_list:
+                    filtered_data.append({
+                        'biome': biome,
+                        'day': day_dict if is_replace else day_list,
+                        'night': night_dict if is_replace else night_list,
+                        'is_replace': is_replace
+                    })
+            
+            # Calculate total visible (only matching tracks)
+            total_visible = sum(
+                len(d['day']) + len(d['night']) 
+                for d in filtered_data
+            )
+            
+            # Emit results
+            self.filter_complete.emit(filtered_data, total_count)
+        
+        except Exception as e:
+            print(f'[SEARCH_ERROR] Error in search filter: {e}')
+            import traceback
+            traceback.print_exc()
+
+
+
+
+sys.exit(app.exec_())

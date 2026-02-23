@@ -36,11 +36,16 @@ build/
 *.log
 Copilot_debug_log.txt
 AStarSoundlog_current.txt
+.logs/
 
 # Debug and test files
 debug_*.txt
 test_*.txt
+test_output.txt
+/startup_test.log
 *.screenshot.png
+/pygui/starsoundlogs
+/pygui/screenshots
 
 # OS specific
 Thumbs.db
@@ -48,35 +53,10 @@ Thumbs.db
 
 # Sensitive Files
 /.github/copilot-instructions.md
-/SAVE_ARCHITECTURE_AI.md
 
 # User-specific configuration files
 settings.json
-/pygui/starsoundlogs
-/pygui/screenshots
 /pygui/vanilla_tracks
 /mod_saves
+/backups
 
-#test files
-/test_biome_processing.py
-/test_both_mode.py
-/test_button_logic.py
-/test_clipping_protection.py
-/test_complete_flow.py
-/test_dialog_styling.py
-/test_duration_validation.py
-/test_fade_settings.py
-/test_file_list_integrity.py
-/test_final_verification.py
-/test_json_formatting.py
-/test_mixed_file_selection.py
-/test_multi_file_split_preview.py
-/test_per_file_split_config.py
-/test_segment_tracking.py
-/test_setEnabled_fix.py
-/test_split_audio_defaults.py
-/test_track_retrieval.py
-/test_vanilla_setup.py
-analyze_vanilla_tracks.py
-test_output.txt
-TRACK_SPLITTING_TEST_CHECKLIST.md

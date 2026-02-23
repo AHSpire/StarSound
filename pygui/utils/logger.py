@@ -214,10 +214,6 @@ class StarSoundLogger:
         except Exception as e:
             print(f'[LOGGER ERROR] Failed to rewrite log header: {e}')
 
-
-    def warn(self, message):
-        self.log(message, level='WARNING')
-
     def _format_metadata_kv(self, meta):
         return '\n'.join(f'{k}: {v}' for k, v in meta.items() if v not in (None, '', 'Unknown'))
 

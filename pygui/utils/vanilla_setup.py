@@ -29,8 +29,8 @@ class VanillaSetup:
         self.unpacker_path = self.starbound_path / 'win32' / 'asset_unpacker.exe'
         self.packed_pak_path = self.starbound_path / 'assets' / 'packed.pak'
         self.vanilla_tracks_dir = Path(starsound_dir) / 'pygui' / 'vanilla_tracks'
-        # Load biome_tracks.json from main pygui folder (always available, not dependent on vanilla_tracks)
-        self.biome_tracks_json = Path(starsound_dir) / 'pygui' / 'biome_tracks.json'
+        # Load biome_tracks.json from vanilla_tracks folder (newly regenerated, complete biome data)
+        self.biome_tracks_json = Path(starsound_dir) / 'pygui' / 'vanilla_tracks' / 'biome_tracks.json'
     
     def check_requirements(self):
         """Check if all files needed for unpacking are available"""
