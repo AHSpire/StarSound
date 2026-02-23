@@ -51,7 +51,7 @@ class VanillaSetupWizard(QDialog):
         # Store initialization parameters
         self.starbound_path = starbound_path
         self.starsound_dir = starsound_dir
-        self.logger = get_logger('VanillaSetupWizard')
+        self.logger = get_logger()
         
         self.init_ui()
     
