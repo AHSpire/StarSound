@@ -48,6 +48,11 @@ class VanillaSetupWizard(QDialog):
         self.setMinimumWidth(600)
         self.setMinimumHeight(400)
         
+        # Store initialization parameters
+        self.starbound_path = starbound_path
+        self.starsound_dir = starsound_dir
+        self.logger = get_logger('VanillaSetupWizard')
+        
         self.init_ui()
     
     def show_help(self):
