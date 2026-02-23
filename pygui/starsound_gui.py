@@ -7716,17 +7716,40 @@ class ExportWorker(QThread):
 
 if __name__ == '__main__':
     import atexit
-    app = QApplication(sys.argv)
-    # Apply centralized stylesheet based on UI_STYLE_GUIDE
-    apply_global_stylesheet(app)
-    window = MainWindow()
-    window.show()
-    def log_exit():
+    import traceback
+    
+    try:
+        app = QApplication(sys.argv)
+        # Apply centralized stylesheet based on UI_STYLE_GUIDE
+        apply_global_stylesheet(app)
+        window = MainWindow()
+        window.show()
+        def log_exit():
+            try:
+                window.logger.log('App exited')
+            except Exception:
+                pass
+        atexit.register(log_exit)
+        sys.exit(app.exec_())
+    except Exception as e:
+        # Display error dialog even if everything is broken
+        print(f"CRITICAL ERROR at startup:\n{e}")
+        print(f"\nFull traceback:\n{traceback.format_exc()}")
+        
+        # Try to show error in message box
         try:
-            window.logger.log('App exited')
-        except Exception:
-            pass
-    atexit.register(log_exit)
+            error_app = QApplication(sys.argv) if not QApplication.instance() else QApplication.instance()
+            QMessageBox.critical(
+                None,
+                '❌ StarSound Startup Error',
+                f'StarSound encountered a critical error and cannot start:\n\n{str(e)}\n\n'
+                f'Please check the console output for more details, or contact support.\n\n'
+                f'Error details:\n{traceback.format_exc()}'
+            )
+        except Exception as msg_err:
+            print(f"Could not show error dialog: {msg_err}")
+        
+        sys.exit(1)
 
 
 # SearchFilterWorker - background thread for fast track searching
